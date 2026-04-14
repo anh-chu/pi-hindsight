@@ -105,8 +105,11 @@ const OPERATIONAL_TOOLS = [
 // Extension
 // ---------------------------------------------------------------------------
 
+const MAX_RECALL_ATTEMPTS = 3;
+
 export default function hindsightExtension(pi: ExtensionAPI) {
   let recallDone = false;
+  let recallAttempts = 0;
   let currentPrompt = "";
 
   // Track user input for fallback
@@ -117,12 +120,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     recallDone = false;
-    log("session_start: recallDone reset");
+    recallAttempts = 0;
+    log("session_start: state reset");
   });
 
   pi.on("session_compact", async () => {
     recallDone = false;
-    log("session_compact: recallDone reset");
+    recallAttempts = 0;
+    log("session_compact: state reset");
   });
 
   // -----------------------------------------------------------------------
@@ -237,20 +242,27 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       log("before_agent_start: skip (recallDone=true)");
       return;
     }
-    recallDone = true;
-    log("before_agent_start: firing recall");
+    if (recallAttempts >= MAX_RECALL_ATTEMPTS) {
+      log(`before_agent_start: skip (max attempts ${MAX_RECALL_ATTEMPTS} reached)`);
+      return;
+    }
+
+    recallAttempts++;
+    log(`before_agent_start: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}`);
 
     const config = getConfig();
     if (!config || !config.api_url) {
-      log("before_agent_start: no config, skipping");
+      log("before_agent_start: no config, giving up");
+      recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry — config won't change mid-session
       return;
     }
 
     const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
     const banks = getRecallBanks(config);
     log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
-    
+
     try {
+      let anyBankSucceeded = false;
       const recallPromises = banks.map(async (bank) => {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
           method: "POST",
@@ -260,11 +272,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           },
           body: JSON.stringify({ query: lastUserPrompt, max_tokens: 1024 })
         });
-        
+
         if (!res.ok) {
           log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
           return [];
         }
+        anyBankSucceeded = true;
         const data = await res.json();
         const results = (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
         log(`before_agent_start: bank=${bank} got ${results.length} results`);
@@ -272,25 +285,31 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       });
 
       const resultsArrays = await Promise.all(recallPromises);
-      const allResults = resultsArrays.flat();
-      
-      if (allResults.length > 0) {
-        log(`before_agent_start: injecting ${allResults.length} memories into context`);
-        const memoriesStr = allResults.join("\n\n");
-        const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
-        
-        return {
-          message: {
-            customType: "hindsight-recall",
-            content,
-            display: false
-          }
-        };
+
+      if (anyBankSucceeded) {
+        // Server responded — mark done regardless of result count
+        recallDone = true;
+        const allResults = resultsArrays.flat();
+
+        if (allResults.length > 0) {
+          log(`before_agent_start: injecting ${allResults.length} memories into context`);
+          const memoriesStr = allResults.join("\n\n");
+          const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
+          return {
+            message: {
+              customType: "hindsight-recall",
+              content,
+              display: false
+            }
+          };
+        } else {
+          log("before_agent_start: no memories found (empty vault)");
+        }
       } else {
-        log("before_agent_start: no memories found");
+        log(`before_agent_start: all banks failed, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
       }
     } catch (e) {
-      log(`before_agent_start: error ${e}`);
+      log(`before_agent_start: error ${e}, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
     }
   });
 
@@ -369,28 +388,41 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     try {
       const banks = getRetainBanks(config, lastUserPrompt);
       log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
-      
-      // Fire and forget POST to all active banks
-      banks.forEach(bank => {
-        fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify({
-            items: [{ 
-              content: transcript,
-              ...(extractedTags.length > 0 && { tags: extractedTags })
-            }],
-            async: true
-          })
-        }).then(res => {
+
+      const results = await Promise.allSettled(
+        banks.map(async (bank) => {
+          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${config.api_key || ""}`
+            },
+            body: JSON.stringify({
+              items: [{
+                content: transcript,
+                ...(extractedTags.length > 0 && { tags: extractedTags })
+              }],
+              async: true
+            })
+          });
           log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
-        }).catch(e => {
-          log(`agent_end: bank=${bank} retain error ${e}`);
-        });
-      });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return bank;
+        })
+      );
+
+      const allFailed = results.every(r => r.status === "rejected");
+      if (allFailed) {
+        log("agent_end: all banks failed — sending next-turn notification");
+        (pi as any).sendMessage(
+          {
+            customType: "hindsight-retain-failed",
+            content: "**Hindsight:** Auto-retain failed (server unreachable). Use `hindsight_retain` to save manually if this conversation has important insights.",
+            display: false,
+          },
+          { deliverAs: "nextTurn" }
+        );
+      }
     } catch (e) {
       log(`agent_end: error ${e}`);
     }

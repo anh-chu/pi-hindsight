@@ -136,6 +136,8 @@ async function loadExtension(fetchMock: any) {
 // same hooks pattern without importing the full module.
 // ---------------------------------------------------------------------------
 
+const MAX_RECALL_ATTEMPTS = 3;
+
 /**
  * Simulates the before_agent_start lifecycle with injectable dependencies.
  */
@@ -145,14 +147,21 @@ async function simulateRecall(opts: {
   userPrompt: string;
   fetchImpl: any;
   recallDone?: boolean;
-}): Promise<{ recallDone: boolean; injectedContent: string | null }> {
+  recallAttempts?: number;
+}): Promise<{ recallDone: boolean; recallAttempts: number; injectedContent: string | null }> {
   let recallDone = opts.recallDone ?? false;
+  let recallAttempts = opts.recallAttempts ?? 0;
 
-  if (recallDone) return { recallDone, injectedContent: null };
-  recallDone = true;
+  if (recallDone) return { recallDone, recallAttempts, injectedContent: null };
+  if (recallAttempts >= MAX_RECALL_ATTEMPTS) return { recallDone, recallAttempts, injectedContent: null };
+
+  recallAttempts++;
 
   const config = opts.config;
-  if (!config || !config.api_url) return { recallDone, injectedContent: null };
+  if (!config || !config.api_url) {
+    recallAttempts = MAX_RECALL_ATTEMPTS; // give up
+    return { recallDone, recallAttempts, injectedContent: null };
+  }
 
   const banks = new Set<string>();
   if (config.global_bank) banks.add(config.global_bank);
@@ -160,6 +169,7 @@ async function simulateRecall(opts: {
   const bankList = Array.from(banks);
 
   try {
+    let anyBankSucceeded = false;
     const recallPromises = bankList.map(async (bank) => {
       const res = await opts.fetchImpl(
         `${config.api_url}/v1/default/banks/${bank}/memories/recall`,
@@ -170,19 +180,28 @@ async function simulateRecall(opts: {
         }
       );
       if (!res.ok) return [];
+      anyBankSucceeded = true;
       const data = await res.json();
       return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
     });
 
-    const allResults = (await Promise.all(recallPromises)).flat();
-    if (allResults.length > 0) {
-      const memoriesStr = allResults.join("\n\n");
-      const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
-      return { recallDone, injectedContent: content };
+    const resultsArrays = await Promise.all(recallPromises);
+
+    if (anyBankSucceeded) {
+      recallDone = true;
+      const allResults = resultsArrays.flat();
+      if (allResults.length > 0) {
+        const memoriesStr = allResults.join("\n\n");
+        const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
+        return { recallDone, recallAttempts, injectedContent: content };
+      }
+      return { recallDone, recallAttempts, injectedContent: null };
     }
-    return { recallDone, injectedContent: null };
+    // all banks failed — don't mark done, will retry
+    return { recallDone, recallAttempts, injectedContent: null };
   } catch {
-    return { recallDone, injectedContent: null };
+    // network error — don't mark done, will retry
+    return { recallDone, recallAttempts, injectedContent: null };
   }
 }
 
@@ -195,17 +214,17 @@ async function simulateRetain(opts: {
   userPrompt: string;
   transcript: string;
   fetchImpl: any;
-}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[] }> {
+}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[]; allFailed: boolean }> {
   const config = opts.config;
-  if (!config || !config.api_url) return { skipped: true, reason: "no config", calledBanks: [] };
+  if (!config || !config.api_url) return { skipped: true, reason: "no config", calledBanks: [], allFailed: false };
 
   const prompt = opts.userPrompt;
-  if (!prompt) return { skipped: true, reason: "no prompt", calledBanks: [] };
+  if (!prompt) return { skipped: true, reason: "no prompt", calledBanks: [], allFailed: false };
   if (prompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(prompt.trim())) {
-    return { skipped: true, reason: "trivial", calledBanks: [] };
+    return { skipped: true, reason: "trivial", calledBanks: [], allFailed: false };
   }
   if (prompt.trim().startsWith("#nomem") || prompt.trim().startsWith("#skip")) {
-    return { skipped: true, reason: "opt-out", calledBanks: [] };
+    return { skipped: true, reason: "opt-out", calledBanks: [], allFailed: false };
   }
 
   const banks = new Set<string>();
@@ -217,17 +236,20 @@ async function simulateRetain(opts: {
   const calledBanks: string[] = [];
   const bankList = Array.from(banks);
 
-  await Promise.all(
+  const results = await Promise.allSettled(
     bankList.map(async (bank) => {
-      await opts.fetchImpl(`${config.api_url}/v1/default/banks/${bank}/memories`, {
+      const res = await opts.fetchImpl(`${config.api_url}/v1/default/banks/${bank}/memories`, {
         method: "POST",
         body: JSON.stringify({ items: [{ content: opts.transcript }], async: true }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       calledBanks.push(bank);
+      return bank;
     })
   );
 
-  return { skipped: false, calledBanks };
+  const allFailed = results.every(r => r.status === "rejected");
+  return { skipped: false, calledBanks, allFailed };
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +328,7 @@ describe("Recall (before_agent_start)", () => {
     assert.equal(result.injectedContent, null);
   });
 
-  test("fails silently on network error", async () => {
+  test("network error: recallDone stays false for retry, no throw", async () => {
     const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
     const result = await simulateRecall({
       config,
@@ -316,10 +338,11 @@ describe("Recall (before_agent_start)", () => {
     });
 
     assert.equal(result.injectedContent, null, "should return null, not throw");
-    assert.equal(result.recallDone, true, "recallDone still flips");
+    assert.equal(result.recallDone, false, "recallDone stays false — retry eligible");
+    assert.equal(result.recallAttempts, 1, "attempt counter incremented");
   });
 
-  test("fails silently on HTTP error", async () => {
+  test("HTTP error: recallDone stays false for retry", async () => {
     const fetchMock = mockFetchFail(503);
     const result = await simulateRecall({
       config,
@@ -329,6 +352,20 @@ describe("Recall (before_agent_start)", () => {
     });
 
     assert.equal(result.injectedContent, null);
+    assert.equal(result.recallDone, false, "recallDone stays false — retry eligible");
+  });
+
+  test("empty vault: recallDone=true even with 0 results (server responded ok)", async () => {
+    const fetchMock = mockFetchOk([]);
+    const result = await simulateRecall({
+      config,
+      projectBank: "project-hindsight",
+      userPrompt: "test",
+      fetchImpl: fetchMock,
+    });
+
+    assert.equal(result.recallDone, true, "server responded — no reason to retry");
+    assert.equal(result.injectedContent, null, "nothing to inject");
   });
 
   test("only queries project bank when no global_bank configured", async () => {
@@ -341,6 +378,40 @@ describe("Recall (before_agent_start)", () => {
     });
 
     assert.equal(fetchMock.mock.calls.length, 1, "should only query 1 bank");
+  });
+
+  test("stops retrying after MAX_RECALL_ATTEMPTS", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    // Single-bank config so fetch calls == attempt count (no global_bank)
+    const singleBankConfig = { api_url: "http://localhost:4000", api_key: "key" };
+    let state = { recallDone: false, recallAttempts: 0, injectedContent: null as string | null };
+
+    for (let i = 0; i < MAX_RECALL_ATTEMPTS + 2; i++) {
+      state = await simulateRecall({
+        config: singleBankConfig,
+        projectBank: "project-hindsight",
+        userPrompt: "test",
+        fetchImpl: fetchMock,
+        recallDone: state.recallDone,
+        recallAttempts: state.recallAttempts,
+      });
+    }
+
+    assert.equal(fetchMock.mock.calls.length, MAX_RECALL_ATTEMPTS, `fetch called exactly ${MAX_RECALL_ATTEMPTS} times`);
+    assert.equal(state.recallDone, false);
+  });
+
+  test("no config: gives up immediately without fetch", async () => {
+    const fetchMock = mockFetchOk([{ text: "memory" }]);
+    const result = await simulateRecall({
+      config: null,
+      projectBank: "project-hindsight",
+      userPrompt: "test",
+      fetchImpl: fetchMock,
+    });
+
+    assert.equal(fetchMock.mock.calls.length, 0);
+    assert.equal(result.recallAttempts, MAX_RECALL_ATTEMPTS, "maxed out — won't retry");
   });
 });
 
@@ -468,26 +539,69 @@ describe("Retain (agent_end)", () => {
     assert.equal(result.skipped, true);
     assert.equal(fetchMock.mock.calls.length, 0);
   });
+
+  test("allFailed=true when all banks return HTTP error", async () => {
+    const fetchMock = mockFetchFail(503);
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-hindsight",
+      userPrompt: "how do I fix this?",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.skipped, false, "should attempt retain, not skip");
+    assert.equal(result.allFailed, true, "should report total failure");
+    assert.equal(result.calledBanks.length, 0, "no banks succeeded");
+  });
+
+  test("allFailed=true when network throws", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-hindsight",
+      userPrompt: "how do I fix this?",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.allFailed, true);
+  });
+
+  test("allFailed=false on success", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-hindsight",
+      userPrompt: "how do I fix this?",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.allFailed, false);
+  });
 });
 
 describe("recallDone lifecycle reset", () => {
-  test("recallDone resets to false on session_start", async () => {
-    // Simulate the state machine
-    let recallDone = true; // as if recall already fired
+  test("recallDone and recallAttempts reset on session_start", async () => {
+    let recallDone = true;
+    let recallAttempts = MAX_RECALL_ATTEMPTS;
 
     // session_start handler
     recallDone = false;
+    recallAttempts = 0;
 
-    assert.equal(recallDone, false, "should reset after session_start");
+    assert.equal(recallDone, false);
+    assert.equal(recallAttempts, 0, "attempts must reset so retry window reopens");
   });
 
-  test("recallDone resets to false on session_compact", async () => {
+  test("recallDone and recallAttempts reset on session_compact", async () => {
     let recallDone = true;
+    let recallAttempts = MAX_RECALL_ATTEMPTS;
 
     // session_compact handler
     recallDone = false;
+    recallAttempts = 0;
 
-    assert.equal(recallDone, false, "should reset after session_compact");
+    assert.equal(recallDone, false);
+    assert.equal(recallAttempts, 0);
   });
 
   test("recallDone prevents double recall within same session", async () => {
