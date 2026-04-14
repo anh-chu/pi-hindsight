@@ -118,15 +118,17 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     else if (event.text) currentPrompt = event.text;
   });
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     recallDone = false;
     recallAttempts = 0;
+    ctx.ui.setStatus("hindsight", undefined); // clear any previous error
     log("session_start: state reset");
   });
 
-  pi.on("session_compact", async () => {
+  pi.on("session_compact", async (_event, ctx) => {
     recallDone = false;
     recallAttempts = 0;
+    ctx.ui.setStatus("hindsight", undefined);
     log("session_compact: state reset");
   });
 
@@ -254,6 +256,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     if (!config || !config.api_url) {
       log("before_agent_start: no config, giving up");
       recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry — config won't change mid-session
+      ctx.ui.setStatus("hindsight", "⚠ not configured");
       return;
     }
 
@@ -263,6 +266,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     try {
       let anyBankSucceeded = false;
+      let authFailed = false;
       const recallPromises = banks.map(async (bank) => {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
           method: "POST",
@@ -275,6 +279,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
         if (!res.ok) {
           log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
+          if (res.status === 401 || res.status === 403) authFailed = true;
           return [];
         }
         anyBankSucceeded = true;
@@ -286,9 +291,17 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
       const resultsArrays = await Promise.all(recallPromises);
 
+      if (authFailed) {
+        recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
+        ctx.ui.setStatus("hindsight", "✗ auth error — check api_key");
+        log("before_agent_start: auth error, giving up");
+        return;
+      }
+
       if (anyBankSucceeded) {
         // Server responded — mark done regardless of result count
         recallDone = true;
+        ctx.ui.setStatus("hindsight", undefined); // clear any previous error
         const allResults = resultsArrays.flat();
 
         if (allResults.length > 0) {
@@ -306,9 +319,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           log("before_agent_start: no memories found (empty vault)");
         }
       } else {
+        const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
+        ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
         log(`before_agent_start: all banks failed, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
       }
     } catch (e) {
+      const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
+      ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
       log(`before_agent_start: error ${e}, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
     }
   });
@@ -414,7 +431,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const allFailed = results.every(r => r.status === "rejected");
       if (allFailed) {
         log("agent_end: all banks failed — sending next-turn notification");
-        (pi as any).sendMessage(
+        ctx.ui.setStatus("hindsight", "⚠ retain failed");
+        pi.sendMessage(
           {
             customType: "hindsight-retain-failed",
             content: "**Hindsight:** Auto-retain failed (server unreachable). Use `hindsight_retain` to save manually if this conversation has important insights.",
@@ -422,6 +440,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           },
           { deliverAs: "nextTurn" }
         );
+      } else {
+        ctx.ui.setStatus("hindsight", undefined); // clear any retain error on success
       }
     } catch (e) {
       log(`agent_end: error ${e}`);
