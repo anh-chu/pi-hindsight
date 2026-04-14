@@ -4,10 +4,26 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
+
+// ---------------------------------------------------------------------------
+// Debug Logging
+// ---------------------------------------------------------------------------
+
+const DEBUG = process.env.HINDSIGHT_DEBUG === "1";
+const LOG_PATH = join(homedir(), ".hindsight", "debug.log");
+
+function log(msg: string) {
+  if (!DEBUG) return;
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    mkdirSync(join(homedir(), ".hindsight"), { recursive: true });
+    appendFileSync(LOG_PATH, line);
+  } catch (_) {}
+}
 
 // ---------------------------------------------------------------------------
 // Config & Helpers
@@ -101,10 +117,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     recallDone = false;
+    log("session_start: recallDone reset");
   });
 
   pi.on("session_compact", async () => {
     recallDone = false;
+    log("session_compact: recallDone reset");
   });
 
   // -----------------------------------------------------------------------
@@ -215,14 +233,22 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   // -----------------------------------------------------------------------
   pi.on("before_agent_start", async (_event, ctx) => {
-    if (recallDone) return;
+    if (recallDone) {
+      log("before_agent_start: skip (recallDone=true)");
+      return;
+    }
     recallDone = true;
+    log("before_agent_start: firing recall");
 
     const config = getConfig();
-    if (!config || !config.api_url) return;
+    if (!config || !config.api_url) {
+      log("before_agent_start: no config, skipping");
+      return;
+    }
 
     const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
     const banks = getRecallBanks(config);
+    log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
     
     try {
       const recallPromises = banks.map(async (bank) => {
@@ -235,15 +261,21 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           body: JSON.stringify({ query: lastUserPrompt, max_tokens: 1024 })
         });
         
-        if (!res.ok) return [];
+        if (!res.ok) {
+          log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
+          return [];
+        }
         const data = await res.json();
-        return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+        const results = (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+        log(`before_agent_start: bank=${bank} got ${results.length} results`);
+        return results;
       });
 
       const resultsArrays = await Promise.all(recallPromises);
       const allResults = resultsArrays.flat();
       
       if (allResults.length > 0) {
+        log(`before_agent_start: injecting ${allResults.length} memories into context`);
         const memoriesStr = allResults.join("\n\n");
         const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
         
@@ -254,9 +286,11 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             display: false
           }
         };
+      } else {
+        log("before_agent_start: no memories found");
       }
     } catch (e) {
-      // Fail silently
+      log(`before_agent_start: error ${e}`);
     }
   });
 
@@ -264,19 +298,28 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // Auto-Retain (agent_end)
   // -----------------------------------------------------------------------
   pi.on("agent_end", async (event: any, ctx) => {
+    log("agent_end: fired");
     const config = getConfig();
-    if (!config || !config.api_url) return;
+    if (!config || !config.api_url) {
+      log("agent_end: no config, skipping");
+      return;
+    }
 
     const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
-    if (!lastUserPrompt) return;
+    if (!lastUserPrompt) {
+      log("agent_end: no user prompt found, skipping");
+      return;
+    }
 
     // Skip trivial interactions
     if (lastUserPrompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(lastUserPrompt.trim())) {
+      log(`agent_end: trivial prompt, skipping retain`);
       return;
     }
 
     // Opt-out mechanism
     if (lastUserPrompt.trim().startsWith("#nomem") || lastUserPrompt.trim().startsWith("#skip")) {
+      log("agent_end: opt-out tag, skipping retain");
       return;
     }
 
@@ -325,6 +368,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     try {
       const banks = getRetainBanks(config, lastUserPrompt);
+      log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
       
       // Fire and forget POST to all active banks
       banks.forEach(bank => {
@@ -341,9 +385,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             }],
             async: true
           })
-        }).catch(() => {});
+        }).then(res => {
+          log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
+        }).catch(e => {
+          log(`agent_end: bank=${bank} retain error ${e}`);
+        });
       });
-    } catch (e) {}
+    } catch (e) {
+      log(`agent_end: error ${e}`);
+    }
   });
 
   // -----------------------------------------------------------------------
