@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
   },
   "scripts": {
     "test": "node --experimental-strip-types test.ts",
