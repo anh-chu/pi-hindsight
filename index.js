@@ -22,23 +22,35 @@ function log(msg) {
     }
     catch (_) { }
 }
+function parseConfigFile(filePath) {
+    const raw = readFileSync(filePath, "utf-8");
+    const config = {};
+    for (const line of raw.split("\n")) {
+        const match = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
+        if (match)
+            config[match[1]] = match[2];
+    }
+    return config;
+}
 function getConfig() {
     try {
-        const cfgPath = join(homedir(), ".hindsight", "config");
-        if (!existsSync(cfgPath))
+        const globalCfgPath = join(homedir(), ".hindsight", "config");
+        if (!existsSync(globalCfgPath))
             return null;
-        const content = readFileSync(cfgPath, "utf-8");
-        const config = {};
-        for (const line of content.split("\n")) {
-            const match = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
-            if (match)
-                config[match[1]] = match[2];
-        }
-        // Support legacy bank_id as global_bank
+        const global = parseConfigFile(globalCfgPath);
+        // Project-level override: .hindsight/config in CWD
+        const localCfgPath = join(process.cwd(), ".hindsight", "config");
+        const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
+        const merged = { ...global, ...local };
+        const recallTypesRaw = merged.recall_types;
+        const recall_types = recallTypesRaw
+            ? recallTypesRaw.split(",").map((t) => t.trim()).filter(Boolean)
+            : ["observation"];
         return {
-            api_url: config.api_url,
-            api_key: config.api_key,
-            global_bank: config.global_bank || config.bank_id
+            api_url: merged.api_url,
+            api_key: merged.api_key,
+            global_bank: merged.global_bank || merged.bank_id,
+            recall_types,
         };
     }
     catch (e) {
@@ -78,39 +90,6 @@ function getLastUserMessage(ctx, fallbackPrompt) {
     }
     catch (e) { }
     return fallbackPrompt;
-}
-function inferProjectMission() {
-    try {
-        const pkgPath = join(process.cwd(), "package.json");
-        if (existsSync(pkgPath)) {
-            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-            if (pkg.description)
-                return pkg.description;
-        }
-    }
-    catch (_) { }
-    try {
-        const readmePath = join(process.cwd(), "README.md");
-        if (existsSync(readmePath)) {
-            const content = readFileSync(readmePath, "utf-8").slice(0, 400).trim();
-            if (content)
-                return content;
-        }
-    }
-    catch (_) { }
-    return basename(process.cwd());
-}
-async function configureBankMission(config, bank, mission) {
-    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}`, {
-        method: "PUT",
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-        },
-        body: JSON.stringify({ mission })
-    });
-    if (!res.ok)
-        throw new Error(`HTTP ${res.status}`);
 }
 async function getBankMission(config, bank) {
     try {
@@ -170,7 +149,6 @@ const hookStats = {
     sessionStart: {},
     recall: {},
     retain: {},
-    missionConfig: {},
 };
 function readRecentLogErrors(maxLines = 20) {
     try {
@@ -211,23 +189,9 @@ export default function hindsightExtension(pi) {
         hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
         hookStats.recall = {};
         hookStats.retain = {};
-        hookStats.missionConfig = {};
         ctx.ui.setStatus("hindsight", undefined);
         log("session_start: state reset");
         const config = getConfig();
-        if (config?.api_url) {
-            const bank = getProjectBank();
-            const mission = inferProjectMission();
-            configureBankMission(config, bank, mission)
-                .then(() => {
-                hookStats.missionConfig = { firedAt: new Date().toISOString(), result: "ok", detail: mission.slice(0, 80) };
-                pi.sendMessage({ customType: "hindsight-mission", content: "", display: true, details: { bank, mission } }, { deliverAs: "nextTurn" });
-            })
-                .catch(e => {
-                hookStats.missionConfig = { firedAt: new Date().toISOString(), result: "failed", detail: String(e) };
-                log(`session_start: mission config failed: ${e}`);
-            });
-        }
     });
     pi.on("session_compact", async (_event, ctx) => {
         recallDone = false;
@@ -242,16 +206,6 @@ export default function hindsightExtension(pi) {
         text += theme.fg("muted", ` recalled ${count} ${count === 1 ? "memory" : "memories"}`);
         if (snippet) {
             text += "\n" + theme.fg("dim", snippet);
-        }
-        return new Text(text, 0, 0);
-    });
-    pi.registerMessageRenderer("hindsight-mission", (message, _options, theme) => {
-        const bank = message.details?.bank ?? "";
-        const mission = message.details?.mission ?? "";
-        let text = theme.fg("accent", "🏦 Hindsight");
-        text += theme.fg("muted", ` mission set for ${bank}`);
-        if (mission) {
-            text += "\n" + theme.fg("dim", mission.slice(0, 120));
         }
         return new Text(text, 0, 0);
     });
@@ -295,7 +249,7 @@ export default function hindsightExtension(pi) {
                             "Content-Type": "application/json",
                             "Authorization": `Bearer ${config.api_key || ""}`
                         },
-                        body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString() })
+                        body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
                     });
                     if (!res.ok)
                         return [];
@@ -410,7 +364,7 @@ export default function hindsightExtension(pi) {
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${config.api_key || ""}`
                     },
-                    body: JSON.stringify({ query: lastUserPrompt, budget: "mid", query_timestamp: new Date().toISOString() })
+                    body: JSON.stringify({ query: lastUserPrompt, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
                 });
                 if (!res.ok) {
                     log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
@@ -603,7 +557,7 @@ export default function hindsightExtension(pi) {
     // Commands
     // -----------------------------------------------------------------------
     pi.registerCommand("hindsight", {
-        description: "Show Hindsight status. Usage: /hindsight [mission [text]]",
+        description: "Show Hindsight status. Usage: /hindsight [status | stats | config]",
         handler: async (args, ctx) => {
             const config = getConfig();
             if (!config) {
@@ -611,26 +565,6 @@ export default function hindsightExtension(pi) {
                 return;
             }
             const argsStr = (typeof args === "string" ? args : "").trim();
-            if (argsStr.startsWith("mission")) {
-                const missionText = argsStr.slice("mission".length).trim();
-                const bank = getProjectBank();
-                if (missionText) {
-                    try {
-                        await configureBankMission(config, bank, missionText);
-                        ctx.ui.notify(`Mission updated for ${bank}:\n${missionText}`, "info");
-                    }
-                    catch (e) {
-                        ctx.ui.notify(`Failed to update mission: ${e}`, "error");
-                    }
-                }
-                else {
-                    const mission = await getBankMission(config, bank);
-                    ctx.ui.notify(mission
-                        ? `Current mission for ${bank}:\n${mission}`
-                        : `No mission set for ${bank}. Use /hindsight mission <text> to set one.`, "info");
-                }
-                return;
-            }
             if (argsStr === "status") {
                 const lines = [];
                 let hasError = false;
@@ -658,9 +592,6 @@ export default function hindsightExtension(pi) {
                 }
                 else {
                     lines.push(`  ✓ auth ok`);
-                    lines.push(bankCheck.mission
-                        ? `  ✓ mission: "${bankCheck.mission.slice(0, 80)}"`
-                        : `  ⚠ no mission set — use /hindsight mission <text>`);
                 }
                 if (config.global_bank)
                     lines.push(`Global: ${config.global_bank}`);
@@ -670,7 +601,6 @@ export default function hindsightExtension(pi) {
                 const hookIcon = (r) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "−" : "…";
                 const fmtHook = (h) => h.firedAt ? `${hookIcon(h.result)} ${h.result}${h.detail ? ` (${h.detail})` : ""}` : "not fired";
                 lines.push(`  session_start:      ${fmtHook(hookStats.sessionStart)}`);
-                lines.push(`  mission config:     ${fmtHook(hookStats.missionConfig)}`);
                 lines.push(`  recall:             ${fmtHook(hookStats.recall)}`);
                 lines.push(`  retain:             ${fmtHook(hookStats.retain)}`);
                 // Debug log
