@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "scripts": {
     "test": "node --experimental-strip-types test.ts",
     "build": "tsc index.ts"
@@ -11,8 +14,13 @@
   "author": "",
   "license": "ISC",
   "type": "module",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.66.1",
+    "@mariozechner/pi-tui": "*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "^0.34.49"
   },
