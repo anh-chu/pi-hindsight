@@ -18,6 +18,27 @@ pi install npm:pi-hindsight
 pi install git:github.com/anh-chu/pi-hindsight
 ```
 
+## Why Hindsight + this extension
+
+Quick take, this pairing helps memory stay useful without extra routine work.
+- **Graph and relationship aware retrieval:** Hindsight retrieval can use semantic, BM25, graph, and temporal strategies, so linked facts are easier to recover.
+- **Entity-aware memory:** people, projects, tools, and artifacts can be recalled as connected context instead of isolated snippets.
+- **Freshness-aware recall:** requests include `query_timestamp`, helping recent context rank higher when it matters.
+- **Project + global memory cooperation:** project bank handles local work history, optional global bank carries cross-project patterns.
+- **Visible and debuggable:** memory recall/retain events show in chat, manual tools exist when you want explicit control.
+- **Efficient retention path:** append-mode updates process new turn deltas, while still retaining important context from every turn.
+
+## How this compares to common agent memory patterns
+
+| Approach | Typical tradeoff | Hindsight + this extension |
+|---|---|---|
+| Markdown/file-based memory notes | Human-readable, but memory quality desaturates over time | Automatic retain + retrieval, still inspectable via banks/tools |
+| ChromaDB-style custom memory stack | Flexible, but requires ongoing schema/retrieval tuning | Built-in memory model + multi-strategy recall pipeline |
+| `pi-memex` style extension memory | Weak de-duplication, limited project/global cooperation | Observation-first recall with deduplication and project/global bank cooperation |
+| `pi-hippo-memory` style extension memory | Good bio-retention behavior, but old memories may be dropped based on policy | Explicit retain/recall hooks with tags, recall type controls, and bank-level persistence |
+
+If you need long-lived, inspectable memory for coding agents, this setup is practical default.
+
 ## Features
 
 ### Automatic Memory Lifecycle
