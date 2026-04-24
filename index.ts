@@ -562,8 +562,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     // Async retain: fire and forget, don't block
     if (config.async_retain !== false) {
       log("agent_end: async retain fired (not awaiting)");
-      banks.map(async (bank) => {
-        try {
+      const retainPromise = Promise.allSettled(
+        banks.map(async (bank) => {
           const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
             method: "POST",
             headers: {
@@ -583,11 +583,34 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             })
           });
           log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
-        } catch (e) {
-          log(`agent_end: bank=${bank} retain error ${e}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return bank;
+        })
+      );
+      retainPromise.then((results) => {
+        const succeededBanks = results
+          .filter(r => r.status === "fulfilled")
+          .map(r => (r as PromiseFulfilledResult<string>).value);
+        const allFailed = succeededBanks.length === 0;
+        hookStats.retain = {
+          firedAt: new Date().toISOString(),
+          result: allFailed ? "failed" : "ok",
+          detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+        };
+        if (allFailed) {
+          log("agent_end: async retain — all banks failed");
+          pi.sendMessage(
+            { customType: "hindsight-retain-failed", content: "", display: true },
+            { deliverAs: "nextTurn" }
+          );
+        } else {
+          log(`agent_end: async retain — succeeded banks=${succeededBanks.join(",")}`);
+          pi.sendMessage(
+            { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
+            { deliverAs: "nextTurn" }
+          );
         }
       });
-      // Fire and forget - return early without awaiting or notifying
       return;
     }
 

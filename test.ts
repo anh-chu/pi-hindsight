@@ -851,7 +851,7 @@ describe("Retain next-turn messages", () => {
 describe("Retain async_retain config", () => {
   const config = { api_url: "http://localhost:4000", api_key: "key", global_bank: "global" };
 
-  test("async_retain=true (default): returns early without awaiting", async () => {
+  test("async_retain=true (default): returns early without blocking turn", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
       config,
