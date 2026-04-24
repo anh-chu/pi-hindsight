@@ -109,6 +109,7 @@ recall_max_tokens = 512
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
+| `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, this bank is queried alongside the project bank on every recall. Turns tagged `#global` or `#me` are also retained here. Leave unset if you only want per-project memory. |
 
 ## Commands
 
@@ -138,10 +139,17 @@ Show current effective configuration.
 
 ## Banks
 
-- **Project bank** (`project-<dirname>`): auto-created per working directory. All turns retained here by default.
-- **Global bank**: optional, set via `global_bank` in config. Receives turns tagged `#global` or `#me`. Also queried during recall for cross-project knowledge.
+### Project bank
 
-Both banks are queried in parallel on every first turn, so project-specific and cross-project memories are always available.
+Named `project-<dirname>` based on your current working directory, created automatically on first use. No setup required. All turns are retained here by default, so each project builds its own isolated memory over time.
+
+### Global bank
+
+Optional. Set `global_bank = <bank-id>` in your config to enable it. The global bank is meant for knowledge that applies across projects: preferred patterns, personal conventions, people and teams you work with, recurring tools.
+
+On each session's first turn, both banks are queried in parallel and their results are merged into a single recall injection. You get project-specific context and cross-project context together, with no duplicated queries.
+
+Turns are retained to the global bank only when you explicitly tag the prompt with `#global` or `#me`. Everything else goes to the project bank only, keeping global memory intentional.
 
 ## Debug logging
 
@@ -160,6 +168,8 @@ For benchmarks, latency analysis, recommended settings, and a Supabase index che
 | Markdown/file-based memory | Human-readable, but quality degrades over time | Automatic retain + retrieval, still inspectable |
 | Custom vector DB (ChromaDB, etc.) | Flexible, but requires ongoing tuning | Built-in memory model with multi-strategy recall |
 | Other Pi memory extensions | Often weak deduplication or limited bank cooperation | Observation-first recall with dedup, project + global bank cooperation |
+
+On every first turn, both your project bank and global bank are queried in parallel. Project memories cover the current codebase; global memories carry patterns and preferences you've built across all your projects. You get both without any extra setup beyond setting `global_bank` in your config.
 
 Hindsight uses semantic, BM25, graph, and temporal retrieval strategies. Entities (people, projects, tools) are recalled as connected context, not isolated snippets. Recent memories rank higher automatically.
 
