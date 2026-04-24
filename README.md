@@ -107,6 +107,7 @@ global_bank      = "sil"
 recall_types     = "observation"
 recall_budget    = "mid"
 recall_max_tokens = 800
+async_retain     = true
 ```
 
 ### Project override: `.hindsight/config` (in project root)
@@ -125,6 +126,8 @@ recall_max_tokens = 512
 **`recall_budget`** — controls retrieval depth and breadth. Accepted: `low`, `mid`, `high`. Defaults to `mid`. Use `low` for faster, cheaper lookups with less noise. `high` increases coverage but adds latency and instability (see performance benchmarks).
 
 **`recall_max_tokens`** — maximum tokens the returned memories can occupy. Unset by default (server uses 4096). Lower values reduce context injection noise with no latency impact. Recommended: `800` for everyday use.
+
+**`async_retain`** — controls whether memory retention blocks the end of a turn. Defaults to `true` (non-blocking). Set to `false` to retain synchronously — enables retain failure notifications and `/hindsight status` retain tracking, at the cost of added turn latency.
 
 ## Commands
 

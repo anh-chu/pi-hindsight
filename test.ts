@@ -215,7 +215,8 @@ async function simulateRetain(opts: {
   transcript: string;
   sessionId?: string;
   fetchImpl: any;
-}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[]; allFailed: boolean; lastRequestBody?: any }> {
+  async_retain?: boolean;
+}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[]; allFailed: boolean; lastRequestBody?: any; async?: boolean; sentMessage?: any }> {
   const config = opts.config;
   if (!config || !config.api_url) return { skipped: true, reason: "no config", calledBanks: [], allFailed: false };
   const prompt = opts.userPrompt;
@@ -226,6 +227,12 @@ async function simulateRetain(opts: {
   if (prompt.trim().startsWith("#nomem") || prompt.trim().startsWith("#skip")) {
     return { skipped: true, reason: "opt-out", calledBanks: [], allFailed: false };
   }
+
+  // Async mode: fire and forget, return early without awaiting
+  if (opts.async_retain !== false) {
+    return { skipped: false, calledBanks: [], allFailed: false, async: true };
+  }
+
   const banks = new Set<string>();
   banks.add(opts.projectBank);
   if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
@@ -441,6 +448,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "how do I refactor this function?",
       transcript: "[role: user]\nhow do I refactor this function?\n[role: assistant]\nHere is how...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
 
     assert.equal(result.skipped, false);
@@ -457,6 +465,7 @@ describe("Retain (agent_end)", () => {
         userPrompt: prompt,
         transcript: "...",
         fetchImpl: fetchMock,
+        async_retain: false,
       });
       assert.equal(result.skipped, true, `"${prompt}" should be skipped`);
     }
@@ -471,6 +480,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "hi",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, true);
   });
@@ -483,6 +493,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "#nomem fix this bug please",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, true);
     assert.equal(result.reason, "opt-out");
@@ -496,6 +507,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "#skip this conversation",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, true);
     assert.equal(result.reason, "opt-out");
@@ -509,6 +521,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "remember this #global pattern for all projects",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, false);
     assert.ok(result.calledBanks.includes("global"), "should retain to global bank");
@@ -524,6 +537,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "I prefer tabs over spaces #me",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, false);
     assert.ok(result.calledBanks.includes("global"), "should retain to global bank");
@@ -537,6 +551,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "remember this #global",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.calledBanks.length, 1);
     assert.ok(result.calledBanks.includes("project-hindsight"));
@@ -550,6 +565,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "valid prompt",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, true);
     assert.equal(fetchMock.mock.calls.length, 0);
@@ -563,6 +579,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "how do I fix this?",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, false, "should attempt retain, not skip");
     assert.equal(result.allFailed, true, "should report total failure");
@@ -577,6 +594,7 @@ describe("Retain (agent_end)", () => {
       userPrompt: "how do I fix this?",
       transcript: "...",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.allFailed, true);
   });
@@ -584,12 +602,13 @@ describe("Retain (agent_end)", () => {
   test("allFailed=false on success", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
-      config,
-      projectBank: "project-hindsight",
-      userPrompt: "how do I fix this?",
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-hindsight",
+          userPrompt: "how do I fix this?",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     assert.equal(result.allFailed, false);
   });
 });
@@ -695,6 +714,7 @@ describe("Retain request shape", () => {
       transcript: "user: refactor\nassistant: done",
       sessionId: "abc123",
       fetchImpl: fetchMock,
+      async_retain: false,
     });
     assert.equal(result.skipped, false);
     assert.equal(result.lastRequestBody.items[0].document_id, "session-abc123");
@@ -703,12 +723,13 @@ describe("Retain request shape", () => {
   test("sets update_mode to append", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: "add logging to all routes",
-      transcript: "user: add logging\nassistant: done",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: "add logging to all routes",
+          transcript: "user: add logging\nassistant: done",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     assert.equal(result.lastRequestBody.items[0].update_mode, "append");
   });
 
@@ -716,12 +737,13 @@ describe("Retain request shape", () => {
     const fetchMock = mockFetchOk();
     const prompt = "how do I add a middleware?";
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: prompt,
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: prompt,
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     const context: string = result.lastRequestBody.items[0].context;
     assert.ok(context.startsWith("pi coding session:"), `context should start with label, got: ${context}`);
     assert.ok(context.includes(prompt.slice(0, 20)), "context should include prompt snippet");
@@ -731,12 +753,13 @@ describe("Retain request shape", () => {
     const fetchMock = mockFetchOk();
     const longPrompt = "a".repeat(200) + " end";
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: longPrompt,
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: longPrompt,
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     const context: string = result.lastRequestBody.items[0].context;
     assert.ok(!context.includes(" end"), "context should not include chars past 100");
   });
@@ -745,12 +768,13 @@ describe("Retain request shape", () => {
     const before = Date.now();
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: "show me the build config",
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: "show me the build config",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     const after = Date.now();
     const ts = new Date(result.lastRequestBody.items[0].timestamp).getTime();
     assert.ok(ts >= before && ts <= after, "timestamp should be recent");
@@ -763,12 +787,13 @@ describe("Retain next-turn messages", () => {
   test("success: sends hindsight-retain message with display:true and bank list", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: "refactor the auth module",
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: "refactor the auth module",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     assert.equal(result.skipped, false);
     assert.equal(result.sentMessage?.customType, "hindsight-retain");
     assert.equal(result.sentMessage?.display, true);
@@ -781,12 +806,13 @@ describe("Retain next-turn messages", () => {
   test("failure: sends hindsight-retain-failed message with display:true", async () => {
     const fetchMock = mockFetchFail(503);
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: "refactor the auth module",
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: "refactor the auth module",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     assert.equal(result.allFailed, true);
     assert.equal(result.sentMessage?.customType, "hindsight-retain-failed");
     assert.equal(result.sentMessage?.display, true);
@@ -795,12 +821,13 @@ describe("Retain next-turn messages", () => {
   test("success with #global: banks list includes global bank", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
-      config,
-      projectBank: "project-test",
-      userPrompt: "remember this pattern #global",
-      transcript: "...",
-      fetchImpl: fetchMock,
-    });
+          config,
+          projectBank: "project-test",
+          userPrompt: "remember this pattern #global",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
     const banks: string[] = (result.sentMessage?.details as any)?.banks ?? [];
     assert.ok(banks.includes("project-test"), "should include project bank");
     assert.ok(banks.includes("global"), "should include global bank");
@@ -809,14 +836,49 @@ describe("Retain next-turn messages", () => {
   test("skipped retain: no message sent", async () => {
     const fetchMock = mockFetchOk();
     const result = await simulateRetain({
+          config,
+          projectBank: "project-test",
+          userPrompt: "ok",
+          transcript: "...",
+          fetchImpl: fetchMock,
+          async_retain: false,
+        });
+    assert.equal(result.skipped, true);
+    assert.equal(result.sentMessage, undefined);
+  });
+});
+
+describe("Retain async_retain config", () => {
+  const config = { api_url: "http://localhost:4000", api_key: "key", global_bank: "global" };
+
+  test("async_retain=true (default): returns early without awaiting", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
       config,
       projectBank: "project-test",
-      userPrompt: "ok",
+      userPrompt: "how do I refactor this?",
       transcript: "...",
       fetchImpl: fetchMock,
     });
-    assert.equal(result.skipped, true);
-    assert.equal(result.sentMessage, undefined);
+    assert.equal(result.async, true);
+    assert.equal(result.skipped, false);
+    assert.equal(result.calledBanks.length, 0);
+  });
+
+  test("async_retain=false: awaits and returns full result", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "how do I refactor this?",
+      transcript: "...",
+      fetchImpl: fetchMock,
+      async_retain: false,
+    });
+    assert.equal(result.async, undefined);
+    assert.equal(result.skipped, false);
+    assert.ok(result.calledBanks.length > 0, "should have called banks");
+    assert.equal(result.sentMessage?.customType, "hindsight-retain");
   });
 });
 

@@ -37,6 +37,7 @@ interface HindsightConfig {
   recall_types?: string[];
   recall_budget?: string;
   recall_max_tokens?: number;
+  async_retain?: boolean;
 }
 
 function parseConfigFile(filePath: string): Record<string, string> {
@@ -67,6 +68,7 @@ function getConfig(): HindsightConfig | null {
       : ["observation"];
     const recall_budget = merged.recall_budget || "mid";
     const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
+    const async_retain = merged.async_retain === "false" ? false : true;
     return {
       api_url: merged.api_url,
       api_key: merged.api_key,
@@ -74,6 +76,7 @@ function getConfig(): HindsightConfig | null {
       recall_types,
       recall_budget,
       recall_max_tokens,
+      async_retain,
     };
   } catch (e) {
     return null;
@@ -554,8 +557,42 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
     }
 
+    const banks = getRetainBanks(config, lastUserPrompt);
+
+    // Async retain: fire and forget, don't block
+    if (config.async_retain !== false) {
+      log("agent_end: async retain fired (not awaiting)");
+      banks.map(async (bank) => {
+        try {
+          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${config.api_key || ""}`
+            },
+            body: JSON.stringify({
+              items: [{
+                content: transcript,
+                document_id: `session-${sessionId}`,
+                update_mode: "append",
+                context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
+                timestamp: new Date().toISOString(),
+                ...(extractedTags.length > 0 && { tags: extractedTags })
+              }],
+              async: true
+            })
+          });
+          log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
+        } catch (e) {
+          log(`agent_end: bank=${bank} retain error ${e}`);
+        }
+      });
+      // Fire and forget - return early without awaiting or notifying
+      return;
+    }
+
+    // Sync retain (original behavior)
     try {
-      const banks = getRetainBanks(config, lastUserPrompt);
       log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
 
       const results = await Promise.allSettled(
