@@ -6,7 +6,7 @@ Persistent memory for Pi, backed by a self-hosted [Hindsight](https://github.com
 
 **Best fit for:**
 - Self-hosted Hindsight users who want full data control
-- Long-lived repo work where context carries across sessions
+- Long-lived repo work where context carries across sessions, including cross-project memory via a shared global bank
 - Users who want per-prompt memory controls (`#nomem`, `#global`, `#tags`)
 - Anyone who prefers a minimal, single-file extension with zero extra dependencies
 
