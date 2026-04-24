@@ -26,7 +26,7 @@ Quick take, this pairing helps memory stay useful without extra routine work.
 - **Freshness-aware recall:** requests include `query_timestamp`, helping recent context rank higher when it matters.
 - **Project + global memory cooperation:** project bank handles local work history, optional global bank carries cross-project patterns.
 - **Visible and debuggable:** memory recall/retain events show in chat, manual tools exist when you want explicit control.
-- **Zero-latency retention:** memory is written asynchronously by default — retain fires at turn end without blocking your next prompt. Append-mode updates process only the new delta, so there's no redundant reprocessing either.
+- **Efficient retention path:** memory is written asynchronously by default — retain fires without blocking your next prompt, and append-mode updates process only the new turn delta with no redundant reprocessing.
 
 ## How this compares to common agent memory patterns
 
