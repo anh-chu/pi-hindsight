@@ -1,100 +1,81 @@
-# Hindsight Self-Hosted Extension for Pi
+# pi-hindsight
 
-A fully autonomous Pi coding agent extension for integrating with a self-hosted [Hindsight](https://github.com/vectorize-io/hindsight) server. Brings persistent memory to your AI coding sessions with zero manual intervention.
+*Memory that compounds, not clutters.*
 
-Recommended for most users running Hindsight in production, use self-hosted Hindsight for full data control and stable memory quality.
+Persistent memory for Pi, backed by a self-hosted [Hindsight](https://github.com/vectorize-io/hindsight) server. Install it, point it at your server, and memory works automatically from the first session.
+
+**Best fit for:**
+- Self-hosted Hindsight users who want full data control
+- Long-lived repo work where context carries across sessions
+- Users who want per-prompt memory controls (`#nomem`, `#global`, `#tags`)
+- Anyone who prefers a minimal, single-file extension with zero extra dependencies
+
+## Requirements
+
+This extension connects to a **self-hosted Hindsight server**. It does not include or manage the backend.
+
+You need a running [Hindsight](https://github.com/vectorize-io/hindsight) server.
+
+If you don't have a Hindsight server yet, follow the [Hindsight getting started guide](https://hindsight.vectorize.io/developer/api/quickstart) first, then come back here.
 
 ## Install
-
-### Recommended
 
 ```bash
 pi install npm:pi-hindsight
 ```
 
-### Git fallback
+Or from GitHub:
 
 ```bash
 pi install git:github.com/anh-chu/pi-hindsight
 ```
 
-## Why Hindsight + this extension
+## Quick start
 
-Quick take, this pairing helps memory stay useful without extra routine work.
-- **Graph and relationship aware retrieval:** Hindsight retrieval can use semantic, BM25, graph, and temporal strategies, so linked facts are easier to recover.
-- **Entity-aware memory:** people, projects, tools, and artifacts can be recalled as connected context instead of isolated snippets.
-- **Freshness-aware recall:** requests include `query_timestamp`, helping recent context rank higher when it matters.
-- **Project + global memory cooperation:** project bank handles local work history, optional global bank carries cross-project patterns.
-- **Visible and debuggable:** memory recall/retain events show in chat, manual tools exist when you want explicit control.
-- **Efficient retention path:** memory is written asynchronously by default — retain fires without blocking your next prompt, and append-mode updates process only the new turn delta with no redundant reprocessing.
+1. **Install** the extension (see above).
 
-## How this compares to common agent memory patterns
-
-| Approach | Typical tradeoff | Hindsight + this extension |
-|---|---|---|
-| Markdown/file-based memory notes | Human-readable, but memory quality desaturates over time | Automatic retain + retrieval, still inspectable via banks/tools |
-| ChromaDB-style custom memory stack | Flexible, but requires ongoing schema/retrieval tuning | Built-in memory model + multi-strategy recall pipeline |
-| `pi-memex` style extension memory | Weak de-duplication, limited project/global cooperation | Observation-first recall with deduplication and project/global bank cooperation |
-| `pi-hippo-memory` style extension memory | Good bio-retention behavior, but old memories may be dropped based on policy | Explicit retain/recall hooks with tags, recall type controls, and bank-level persistence |
-
-If you need long-lived, inspectable memory for coding agents, this setup is practical default.
-
-## Features
-
-### Automatic Memory Lifecycle
-
-- **Auto-Recall:** Before each agent turn, queries the project bank and injects relevant memories directly into the prompt. Zero agent action needed.
-- **Auto-Retain:** After each agent turn, appends the conversation transcript to a per-session document (`update_mode: append`) using a stable `document_id`. Hindsight only re-extracts the new delta — no redundant LLM calls.
-- **Feedback Loop Prevention:** Strips `<hindsight_memories>` blocks from the transcript before retain. Prevents recursive memory bloat.
-- **Operational Tool Filtering:** Drops low-signal tools (bash, read, write, edit, etc.) from the retained transcript. Keeps conversation and non-trivial tool calls only.
-
-### Memory Quality
-
-- **Observation-Focused Recall:** Defaults to `observation` type only — consolidated, deduplicated beliefs synthesized from multiple memories. Highest signal, lowest noise. Configurable per-project.
-- **Rich Retain Context:** Each retain includes `context` (derived from the user's prompt), `timestamp`, `document_id`, and `update_mode: append` for best extraction quality.
-- **Temporal Recall:** Recall requests include `query_timestamp` so Hindsight can rank memories by recency.
-- **Budget-Based Recall:** Uses `budget: "mid"` by default, configurable via `recall_budget`. Token budget for injected memories is configurable via `recall_max_tokens` (server default: 4096).
-
-### Opt-In / Opt-Out Controls
-
-- `#nomem` or `#skip` at the start of a prompt — skip retain for that turn.
-- `#global` or `#me` anywhere in a prompt — also retain to your `global_bank` (cross-project learnings).
-- Custom hashtags (e.g. `#architecture`, `#bug`) — extracted and attached as Hindsight tags for filtering.
-
-### In-Chat Visibility
-
-Every memory event is visible in the Pi chat:
-
-| Event | Display |
-|-------|---------|
-| Recall | `🧠 Hindsight recalled N memories` + snippet |
-| Retain (success) | `💾 Hindsight saved turn to memory → bank-name` |
-| Retain (failure) | `💾 Hindsight retain failed — use hindsight_retain to save manually` |
-
-### Manual Tools
-
-Two tools available for explicit memory management:
-
-- `hindsight_recall` — Manually pull additional context from memory
-- `hindsight_retain` — Force-save a specific insight
-
-## Setup
-
-1. Install this extension:
-   ```bash
-   pi install npm:pi-hindsight
-   ```
-
-2. Configure your Hindsight server credentials in `~/.hindsight/config`:
+2. **Configure** your Hindsight server in `~/.hindsight/config`:
    ```toml
    api_url = "http://your-hindsight-server:8888"
    api_key = "<API_KEY>"
    global_bank = "optional-global-bank-id"
    ```
 
-3. Run `/hindsight status` in Pi to verify everything is working.
+3. **Verify** in Pi:
+   ```
+   /hindsight status
+   ```
 
-No further setup needed — memory is fully automatic from the first session.
+That's it. Memory is fully automatic from here: recall before each turn, retain after each turn, no manual intervention needed.
+
+## Features
+
+### Automatic memory lifecycle
+
+- **Auto-recall:** Before each agent turn, relevant memories from your project and global banks are injected into the prompt.
+- **Auto-retain:** After each agent turn, the conversation is appended to a per-session memory document. Only the new delta is processed, no redundant work.
+- **Feedback loop prevention:** Memory blocks are stripped from retained content. No recursive memory bloat.
+- **Noise filtering:** Low-signal tool calls (bash, read, write, edit) are dropped from retained transcripts. Conversation and meaningful tool usage are kept.
+
+### Per-prompt controls
+
+- `#nomem` or `#skip`: skip retain for this turn (sensitive or throwaway prompts).
+- `#global` or `#me`: also retain this turn to your global bank (cross-project learnings).
+- `#architecture`, `#bug`, etc.: custom tags extracted and attached to memory for filtering.
+
+### In-chat visibility
+
+| Event | What you see |
+|-------|-------------|
+| Recall | 🧠 Hindsight recalled N memories + snippet |
+| Retain (success) | 💾 Hindsight saved turn to memory → bank-name |
+| Retain (failure) | 💾 Hindsight retain failed, use hindsight_retain to save manually |
+
+### Manual tools
+
+- `hindsight_recall`: Pull additional context from memory on demand.
+- `hindsight_retain`: Force-save a specific insight.
+- `hindsight_reflect`: Ask Hindsight to synthesize an answer from your memories (server-side reasoning).
 
 ## Configuration
 
@@ -112,34 +93,28 @@ async_retain     = true
 
 ### Project override: `.hindsight/config` (in project root)
 
-Place a `.hindsight/config` file in any project directory to override global settings for that project. Local values win.
+Place a `.hindsight/config` file in any project directory to override global settings. Local values win.
 
 ```toml
-# Include raw events alongside observations for this project
 recall_types     = "observation,experience"
-recall_budget   = "low"
+recall_budget    = "low"
 recall_max_tokens = 512
 ```
 
-**`recall_types`** — comma-separated list of memory types to search during recall. Accepted values: `observation`, `world`, `experience`. Defaults to `observation`. Each type runs the full 4-strategy retrieval pipeline independently, so narrowing this reduces both result set size and query cost.
+### Config reference
 
-**`recall_budget`** — controls retrieval depth and breadth. Accepted: `low`, `mid`, `high`. Defaults to `mid`. Use `low` for faster, cheaper lookups with less noise. `high` increases coverage but adds latency and instability (see performance benchmarks).
-
-**`recall_max_tokens`** — maximum tokens the returned memories can occupy. Unset by default (server uses 4096). Lower values reduce context injection noise with no latency impact. Recommended: `800` for everyday use.
-
-**`async_retain`** — controls whether memory retention blocks the end of a turn. Defaults to `true` (non-blocking). Set to `false` to retain synchronously — enables retain failure notifications and `/hindsight status` retain tracking, at the cost of added turn latency.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `recall_types` | `observation` | Memory types to search: `observation`, `world`, `experience`. Comma-separated. Each type runs the full retrieval pipeline independently. |
+| `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
+| `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
+| `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
 
 ## Commands
 
 ### `/hindsight status`
-Full health check for the current session:
-- Server reachability
-- Auth validity
-- Project bank accessibility
-- Hook execution state (session_start, recall, retain)
-- Debug log tail (when `HINDSIGHT_DEBUG=1`)
+Full health check: server reachability, auth, bank access, hook state, debug log tail.
 
-Example output:
 ```
 URL:    http://localhost:8888
 Server: ✓ online
@@ -156,90 +131,170 @@ Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)
 ```
 
 ### `/hindsight stats`
-Shows memory/entity/document counts for all active banks.
+Memory, entity, and document counts for all active banks.
 
-## Debug Logging
-
-Set `HINDSIGHT_DEBUG=1` to enable verbose logging to `~/.hindsight/debug.log`. Log tail is shown inline in `/hindsight status`.
+### `/hindsight config`
+Show current effective configuration.
 
 ## Banks
 
-- **Project bank** (`project-<dirname>`) — auto-created per working directory. All turns are retained here by default.
-- **Global bank** — optional, configured via `global_bank` in `~/.hindsight/config`. Receives turns tagged `#global` or `#me`.
+- **Project bank** (`project-<dirname>`): auto-created per working directory. All turns retained here by default.
+- **Global bank**: optional, set via `global_bank` in config. Receives turns tagged `#global` or `#me`. Also queried during recall for cross-project knowledge.
+
+Both banks are queried in parallel on every first turn, so project-specific and cross-project memories are always available.
+
+## Debug logging
+
+Set `HINDSIGHT_DEBUG=1` to enable verbose logging to `~/.hindsight/debug.log`. Log tail is shown inline in `/hindsight status`.
 
 ## Performance
 
-### Recall latency benchmarks
+Recall latency depends primarily on your database indexes and hosting tier. With HNSW indexes on Supabase free tier, expect ~4s for a parallel global + project bank recall.
 
-Tested against a self-hosted Hindsight server (2 vCPU / 8 GB RAM) backed by Supabase free tier (shared CPU, pgvector). Pi queries two banks in parallel on every first prompt — one global bank and one project bank.
+For benchmarks, latency analysis, recommended settings, and a Supabase index checklist, see **[docs/performance.md](docs/performance.md)**.
 
-**Setup:**
-- Hindsight server: 2 vCPU / 8 GB RAM, local network (~50ms RTT)
-- Database: Supabase free tier, session pooler mode
-- Embedding: Gemini `embedding-001` (remote API)
-- Banks: 68 memory units (global), 182 memory units (project)
-- Query pattern: 2 parallel recall requests (global + project bank)
+## Why Hindsight over other memory approaches
 
-**Results after HNSW index on `memory_units`:**
+| Approach | Typical tradeoff | Hindsight + this extension |
+|---|---|---|
+| Markdown/file-based memory | Human-readable, but quality degrades over time | Automatic retain + retrieval, still inspectable |
+| Custom vector DB (ChromaDB, etc.) | Flexible, but requires ongoing tuning | Built-in memory model with multi-strategy recall |
+| Other Pi memory extensions | Often weak deduplication or limited bank cooperation | Observation-first recall with dedup, project + global bank cooperation |
 
-| budget | max_tokens | avg wall time | notes |
-|---|---|---|---|
-| `mid` | `512` | ~3.97s | most consistent |
-| `mid` | `1024` | ~4.02s | fine |
-| `mid` | `4096` | ~3.98s | returns all memories |
-| `high` | `512` | ~7.42s | unstable, spiked to 18s |
-| `high` | `1024` | ~4.00s | no benefit over mid |
-| `high` | `4096` | ~4.03s | no benefit over mid |
+Hindsight uses semantic, BM25, graph, and temporal retrieval strategies. Entities (people, projects, tools) are recalled as connected context, not isolated snippets. Recent memories rank higher automatically.
 
-**Recommended settings:**
+## Comparison with [@walodayeet/hindsight-pi](https://github.com/walodayeet/hindsight-pi)
 
-```toml
-# ~/.hindsight/config
-recall_budget     = mid   # high adds instability with no latency benefit
-recall_max_tokens = 512   # reduces context injection noise; no latency impact
-```
+There are two Hindsight extensions for Pi. Both connect to a self-hosted Hindsight server and provide auto-recall and auto-retain. They share the same core goal but differ in philosophy: this extension optimizes for simplicity and per-prompt control, while `@walodayeet/hindsight-pi` optimizes for configurability and operational tooling.
 
-### What causes recall latency
+This section aims to help you pick the right one. Both are good.
 
-In order of impact:
+### At a glance
 
-1. **Missing HNSW index on `memory_units`** — the biggest factor. Without it, every recall is a full sequential cosine scan across all rows. Add partial HNSW indexes per `bank_id` + `fact_type`:
-   ```sql
-   -- example for one bank+type combination
-   CREATE INDEX ON memory_units USING hnsw (embedding vector_cosine_ops)
-     WHERE fact_type = 'observation' AND bank_id = 'your-bank';
-   ```
-   The Hindsight server auto-creates these via `/codesight-init` or the onboarding flow. If missing, create them manually per bank per fact type.
+| Dimension | **pi-hindsight** (this) | **@walodayeet/hindsight-pi** |
+|---|---|---|
+| Install | `pi install npm:pi-hindsight` | `pi install npm:@walodayeet/hindsight-pi` |
+| Backend required | Self-hosted Hindsight server + Postgres (pgvector) + embedding API | Same |
+| Extra dependencies | None (raw `fetch`) | `@vectorize-io/hindsight-client` SDK |
+| Config format | `.ini` | JSON |
+| Codebase | Single file (~450 LOC) | Multi-file modular (~1500 LOC) |
 
-2. **Supabase free tier CPU** — shared, severely throttled. Even with HNSW, expect 3–5s per parallel pair. Concurrent pgvector queries compete for CPU. Upgrading to a paid tier drops this significantly.
+### Recall
 
-3. **Gemini embedding API latency** — ~0.5–1s fixed cost per recall request, unavoidable.
+| Dimension | **pi-hindsight** | **@walodayeet/hindsight-pi** |
+|---|---|---|
+| Trigger | `before_agent_start`, first turn only | `before_agent_start` or `context` hook |
+| Injection frequency | Implicit (internal `recallDone` flag) | Explicit: `first-turn` or `every-turn` |
+| Recall modes | Always auto-inject + manual tools | `hybrid`, `context`, `tools`, or `off` |
+| Dual-bank recall | Always queries global + project in parallel | Queries primary bank + optional `globalBankId` |
+| Recall types | Configurable, defaults to `observation` | Configurable per-type with `recallPerType` count |
+| Budget control | `recall_budget` + `recall_max_tokens` | `budget` + `maxTokens` via SDK |
+| Retry on failure | Up to 3 attempts across turns | No retry on recall failure |
 
-4. **Parallel vs sequential queries** — Pi queries both banks in parallel. Pre-index, this caused severe contention (17–36s). Post-index, parallel is faster than sequential (~4s wall vs ~6s sequential) because Supabase can handle two HNSW queries concurrently once the index is in place.
+**What the differences mean:**
 
-5. **`max_tokens` does not affect latency** — the server does the same work regardless of how many results it returns. Lower `max_tokens` only reduces context injection size.
+- **Recall modes.** `@walodayeet/hindsight-pi` lets you set `recallMode: tools` to skip auto-injection entirely. This eliminates the `before_agent_start` blocking cost, which matters if your Hindsight server is slow or remote. This extension always auto-injects on first turn, no way to disable without unloading the extension.
+- **Dual-bank recall.** Both extensions query multiple banks. This extension always queries global + project banks in parallel on every first turn, so cross-project knowledge is always available. `@walodayeet/hindsight-pi` does the same when `globalBankId` is configured, plus supports linked banks for multi-server setups.
+- **Injection frequency.** `@walodayeet/hindsight-pi` makes the `first-turn` vs `every-turn` choice explicit and prompt-cache-friendly. This extension does the same thing implicitly (the `recallDone` flag), but the behavior is identical in practice.
+- **Retry logic.** This extension retries recall up to 3 times across turns if the server is temporarily unreachable, which helps with flaky connections. `@walodayeet/hindsight-pi` does not retry recall, but retries retain writes with a 1.5s backoff.
 
-### Supabase index checklist
+### Retain
 
-Run in Supabase SQL editor to verify your setup:
+| Dimension | **pi-hindsight** | **@walodayeet/hindsight-pi** |
+|---|---|---|
+| Trigger | `agent_end`, async by default | `agent_end` |
+| Write scheduling | Immediate (async fire-and-forget) or sync | `turn`, `async`, `session`, or N-turn batch |
+| Retain modes | Full transcript, append mode | `response`, `step-batch`, `both`, or `off` |
+| Content retained | User + assistant + non-operational tool calls | User + assistant text (turn summary) |
+| Document strategy | Append-mode with stable `document_id` per session | Per-turn writes, chunked if large |
+| Credential sanitization | No | Yes (strips API keys, tokens, secrets) |
+| Session lifecycle | Resets on `session_compact` | Flushes on shutdown, switch, compact, fork |
 
-```sql
--- confirm HNSW indexes exist on memory_units
-SELECT indexname, indexdef
-FROM pg_indexes
-WHERE tablename = 'memory_units' AND indexdef LIKE '%hnsw%';
+**What the differences mean:**
 
--- confirm no full-table HNSW (redundant, wastes storage)
--- drop if present:
--- DROP INDEX idx_memory_units_embedding_hnsw;
+- **Write scheduling.** `@walodayeet/hindsight-pi` offers `session` (batch all writes until session end) and numeric batching (flush every N turns). This reduces server load for long sessions. This extension fires immediately after each turn, either async (non-blocking, default) or sync (blocks until confirmed).
+- **Retain content.** This extension retains the full transcript including tool call names and inputs (excluding noisy operational tools like `bash`, `read`, `write`). This gives Hindsight richer context for extraction. `@walodayeet/hindsight-pi` retains a user+assistant text summary, which is lighter but may lose tool-use context.
+- **Append mode.** This extension uses `document_id` + `update_mode: append`, so Hindsight only re-extracts the new delta each turn rather than reprocessing the entire session. `@walodayeet/hindsight-pi` writes each turn as separate retain calls, which is simpler but means each turn is processed independently.
+- **Credential sanitization.** `@walodayeet/hindsight-pi` strips API keys, bearer tokens, and secrets from retained content before sending to the server. This extension does not, so secrets in conversation may end up in your Hindsight memory. If you work with credentials in chat, this matters.
+- **Session lifecycle.** `@walodayeet/hindsight-pi` hooks into more Pi lifecycle events (shutdown, switch, fork) to flush pending writes. This extension only resets state on `session_compact`. If Pi exits abruptly with `session`-mode batching, `@walodayeet/hindsight-pi` is more likely to flush pending writes.
 
--- confirm chunks FK indexes exist
-SELECT indexname FROM pg_indexes
-WHERE tablename = 'chunks';
--- should include idx_chunks_bank_id and idx_chunks_document_id
-```
+### Per-prompt controls
 
-## Running Tests
+| Dimension | **pi-hindsight** | **@walodayeet/hindsight-pi** |
+|---|---|---|
+| Opt-out | `#nomem` or `#skip` to skip retain | Not available |
+| Global bank routing | `#global` or `#me` per prompt | Configured at bank strategy level |
+| Custom tags | `#hashtags` in prompt attached to memory | Automatic metadata tags (source, workspace, kind) |
+| Trivial prompt skip | Yes | Yes, plus meta-memory query filtering |
+
+**What the differences mean:**
+
+- **Opt-out.** This extension lets you prevent any single turn from being retained by starting your prompt with `#nomem` or `#skip`. Useful for sensitive discussions, throwaway questions, or noisy debugging sessions. `@walodayeet/hindsight-pi` has no per-prompt opt-out; you would need to set `retainMode: off` in config.
+- **Global bank routing.** This extension lets you tag individual prompts with `#global` or `#me` to also retain that turn to your global bank (cross-project learnings). `@walodayeet/hindsight-pi` routes to global bank based on the configured `bankStrategy`, not per-prompt.
+- **Custom tags.** This extension extracts `#hashtags` from your prompt and attaches them as Hindsight tags, useful for filtering memories later. `@walodayeet/hindsight-pi` adds structured metadata tags automatically (source, workspace, bank, kind) but does not extract user-defined tags from prompts.
+
+### Tooling and setup
+
+| Dimension         | **pi-hindsight**                                            | **@walodayeet/hindsight-pi**                                                          |
+| -------------------| -------------------------------------------------------------| ---------------------------------------------------------------------------------------|
+| Config format     | `.ini` (`~/.hindsight/config`)                              | JSON (`~/.hindsight/config.json`), also reads `.toml`                                 |
+| Config inspection | `/hindsight config` shows current values                    | `/hindsight:where` shows which file won precedence                                    |
+| Setup experience  | Manual: edit config file, run `/hindsight status`           | Interactive: `/hindsight:setup` wizard                                                |
+| Diagnostics       | `/hindsight status` (health + hooks + log tail)             | `/hindsight:doctor` (preflight), `/hindsight:status` (runtime)                        |
+| Manual tools      | `hindsight_recall`, `hindsight_retain`, `hindsight_reflect` | `hindsight_search`, `hindsight_context`, `hindsight_retain`, `hindsight_bank_profile` |
+| Commands          | 3 (`status`, `stats`, `config`)                             | 10+ (setup, settings, doctor, where, sync, map, mode, config, connect, stats)         |
+| Performance docs  | Benchmarks, latency analysis, Supabase index guide          | Not included                                                                          |
+
+**What the differences mean:**
+
+- **Setup.** `@walodayeet/hindsight-pi` has an interactive setup wizard that walks you through enabling Hindsight, setting the URL, choosing bank strategy, and saving. This extension requires manually editing a config file. If you are comfortable with config files, this is fine. If you want a guided first run, theirs is smoother.
+- **Diagnostics.** Both have status commands. `@walodayeet/hindsight-pi` adds `/hindsight:doctor` for preflight checks and `/hindsight:where` to show exactly which config file contributed each value. This extension shows hook state and debug log tail inline in `/hindsight status`.
+- **Tools.** This extension includes `hindsight_reflect` for server-side memory synthesis (Hindsight reasons over your memories and returns a synthesized answer). `@walodayeet/hindsight-pi` includes `hindsight_context` (similar, backed by the reflect API) and `hindsight_bank_profile` for inspecting bank metadata.
+- **Performance documentation.** This extension includes latency benchmarks, analysis of what causes slow recall, and a Supabase index checklist. Useful if you are tuning a self-hosted setup.
+
+### Backend requirements
+
+Both extensions require the same backend:
+- A self-hosted [Hindsight](https://github.com/vectorize-io/hindsight) server
+- Postgres with pgvector (Supabase works, dedicated Postgres works)
+- An embedding API (Gemini `embedding-001` or compatible)
+- HNSW indexes on `memory_units` for acceptable recall latency (see [Performance tuning](docs/performance.md))
+
+Neither extension bundles or manages the backend. You deploy Hindsight separately and point the extension at it via config.
+
+This extension uses raw `fetch` calls against the Hindsight REST API, no SDK dependency. `@walodayeet/hindsight-pi` uses the official `@vectorize-io/hindsight-client` SDK, which adds a dependency but tracks API changes automatically.
+
+### When to choose this extension
+
+- You want a single-file, low-overhead setup with minimal config.
+- Per-prompt memory controls matter: `#nomem` to skip, `#global` to route, `#tags` to annotate.
+- You prefer full transcript retention with append-mode documents over turn summaries.
+- You want `hindsight_reflect` for server-side memory synthesis.
+- You want documented performance benchmarks and Supabase index guidance.
+- You prefer zero extra dependencies beyond Pi itself.
+
+### When to choose @walodayeet/hindsight-pi
+
+- You want granular recall control: `tools`-only mode eliminates cold-start latency from `before_agent_start` blocking.
+- Flexible retain scheduling matters: `session`, `async`, or N-turn batching to reduce server load.
+- You want a setup wizard and diagnostic commands (`/hindsight:doctor`, `/hindsight:where`).
+- Credential sanitization in retained content is important to you.
+- You prefer JSON config with a richer settings hierarchy.
+- You want the official Hindsight client SDK for automatic API compatibility.
+
+### Shared strengths
+
+Both extensions:
+- Auto-recall relevant memories before agent turns
+- Auto-retain conversation after agent turns
+- Query global + project banks for cross-project knowledge
+- Show visible recall/retain indicators in chat
+- Provide manual tools for explicit memory operations
+- Skip trivial prompts to reduce noise
+- Support project-level config overrides
+- Work with any self-hosted Hindsight server
+
+## Running tests
 
 ```bash
 node --experimental-strip-types test.ts
