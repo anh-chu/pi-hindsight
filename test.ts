@@ -142,7 +142,7 @@ const MAX_RECALL_ATTEMPTS = 3;
  * Simulates the before_agent_start lifecycle with injectable dependencies.
  */
 async function simulateRecall(opts: {
-  config: { api_url: string; api_key?: string; global_bank?: string } | null;
+  config: { api_url: string; api_key?: string; global_bank?: string; recall_budget?: string; recall_max_tokens?: number } | null;
   projectBank: string;
   userPrompt: string;
   fetchImpl: any;
@@ -176,7 +176,7 @@ async function simulateRecall(opts: {
         {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.api_key || ""}` },
-          body: JSON.stringify({ query: opts.userPrompt, budget: "mid", query_timestamp: new Date().toISOString() }),
+          body: JSON.stringify({ query: opts.userPrompt, budget: opts.config?.recall_budget || "mid", query_timestamp: new Date().toISOString(), ...(opts.config?.recall_max_tokens && { max_tokens: opts.config.recall_max_tokens }) }),
         }
       );
       if (!res.ok) return [];

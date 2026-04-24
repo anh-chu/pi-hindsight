@@ -35,6 +35,8 @@ interface HindsightConfig {
   api_key?: string;
   global_bank?: string;
   recall_types?: string[];
+  recall_budget?: string;
+  recall_max_tokens?: number;
 }
 
 function parseConfigFile(filePath: string): Record<string, string> {
@@ -63,11 +65,15 @@ function getConfig(): HindsightConfig | null {
     const recall_types = recallTypesRaw
       ? recallTypesRaw.split(",").map((t) => t.trim()).filter(Boolean)
       : ["observation"];
+    const recall_budget = merged.recall_budget || "mid";
+    const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
     return {
       api_url: merged.api_url,
       api_key: merged.api_key,
       global_bank: merged.global_bank || merged.bank_id,
       recall_types,
+      recall_budget,
+      recall_max_tokens,
     };
   } catch (e) {
     return null;
@@ -282,13 +288,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const banks = getRecallBanks(config);
       try {
         const recallPromises = banks.map(async (bank) => {
+          const reqBody: Record<string, any> = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
+          if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
           const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${config.api_key || ""}`
             },
-            body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
+            body: JSON.stringify(reqBody)
           });
           if (!res.ok) return [];
           const data = await res.json();
@@ -400,13 +408,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       let anyBankSucceeded = false;
       let authFailed = false;
       const recallPromises = banks.map(async (bank) => {
+        const reqBody: Record<string, any> = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
+        if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${config.api_key || ""}`
           },
-          body: JSON.stringify({ query: lastUserPrompt, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
+          body: JSON.stringify(reqBody)
         });
 
         if (!res.ok) {
