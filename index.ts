@@ -34,6 +34,7 @@ interface HindsightConfig {
   api_url?: string;
   api_key?: string;
   global_bank?: string;
+  project_bank_id?: string;
   recall_types?: string[];
   recall_budget?: string;
   recall_max_tokens?: number;
@@ -79,6 +80,7 @@ function getConfig(): HindsightConfig | null {
       api_url: merged.api_url,
       api_key: merged.api_key,
       global_bank: merged.global_bank,
+      project_bank_id: merged.project_bank_id,
       recall_types,
       recall_budget,
       recall_max_tokens,
@@ -137,7 +139,8 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
   return { global, local, merged: { ...global, ...local }, isHomeDir };
 }
 
-function getProjectBank(): string {
+function getProjectBank(config?: HindsightConfig | null): string {
+  if (config?.project_bank_id) return config.project_bank_id;
   return `project-${basename(process.cwd())}`;
 }
 
@@ -150,7 +153,7 @@ function getRecallBanks(config: HindsightConfig): string[] {
   if (config.global_bank) banks.add(config.global_bank);
   // Skip project bank in homedir when homedir_project is disabled
   if (!(isHomeDirSession() && config.homedir_project === false)) {
-    banks.add(getProjectBank());
+    banks.add(getProjectBank(config));
   }
   return Array.from(banks);
 }
@@ -159,7 +162,7 @@ function getRetainBanks(config: HindsightConfig, prompt: string): string[] {
   const banks = new Set<string>();
   const skipProject = isHomeDirSession() && config.homedir_project === false;
   if (!skipProject) {
-    banks.add(getProjectBank());
+    banks.add(getProjectBank(config));
   } else if (config.global_bank) {
     // In homedir with project disabled, retain to global bank instead
     banks.add(config.global_bank);
@@ -407,7 +410,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const config = getConfig();
       if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
 
-      const bank = getProjectBank();
+      const bank = getProjectBank(config);
       try {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
           method: "POST",
@@ -437,7 +440,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const config = getConfig();
       if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
 
-      const bank = getProjectBank();
+      const bank = getProjectBank(config);
       try {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
           method: "POST",
@@ -799,7 +802,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         if (!health.ok) hasError = true;
 
         // Project bank: auth + mission
-        const bank = getProjectBank();
+        const bank = getProjectBank(config);
         lines.push(`Bank:   ${bank}`);
         const bankCheck = await checkBankConfig(config, bank);
         if (!bankCheck.ok) {
@@ -862,6 +865,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           { key: "api_url", label: "API URL", isBool: false, default: "(required)" },
           { key: "api_key", label: "API Key", isBool: false, default: "(required)" },
           { key: "global_bank", label: "Global Bank", isBool: false, default: "(not set)" },
+          { key: "project_bank_id", label: "Project Bank Override", isBool: false, default: "(auto)" },
           { key: "recall_enabled", label: "Auto-Recall", isBool: true, default: "true" },
           { key: "retain_enabled", label: "Auto-Retain", isBool: true, default: "true" },
           { key: "async_retain", label: "Async Retain", isBool: true, default: "true" },
@@ -945,7 +949,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const status = [
         `URL: ${config.api_url || "Not set"}`,
         `Global Bank: ${config.global_bank || "Not set"}`,
-        `Project Bank (Recall & Default Retain): ${getProjectBank()}`,
+        `Project Bank (Recall & Default Retain): ${getProjectBank(config)}`,
         `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
         `Commands: /hindsight status | stats | settings`,
       ].join("\n");
