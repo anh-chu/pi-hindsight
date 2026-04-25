@@ -348,14 +348,25 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     if (config) {
       const banks = getRecallBanks(config);
       if (banks.length === 0) {
-        ctx.ui.setStatus("hindsight", "⚠ no active banks");
+        ctx.ui.setStatus("hindsight", "⚠ no banks — /hindsight settings to configure");
+        ctx.ui.notify(
+          "Hindsight has no active banks. Memory recall and retain are disabled.\n" +
+          "\n" +
+          "Fix: run /hindsight settings and set global_bank, or set homedir_project = true.",
+          "warning"
+        );
         log("session_start: no active banks — global_bank not set and homedir_project=false in home dir");
       }
       const legacyIssues = detectLegacyKeys();
       if (legacyIssues.length > 0) {
-        const keys = legacyIssues.map(i => i.key).join(", ");
-        ctx.ui.setStatus("hindsight", `⚠ legacy config: ${keys}`);
-        log(`session_start: legacy keys detected: ${keys}. Run /hindsight doctor to migrate.`);
+        const keys = legacyIssues.map(i => `${i.key} → ${i.canonical}`).join(", ");
+        ctx.ui.setStatus("hindsight", "⚠ outdated config — run /hindsight doctor");
+        ctx.ui.notify(
+          `Your config uses deprecated keys: ${keys}\n` +
+          "Run /hindsight doctor to auto-migrate, or update manually.",
+          "warning"
+        );
+        log(`session_start: legacy keys detected: ${keys}`);
       }
     }
   });
