@@ -128,6 +128,47 @@ function applyAliases(raw: Record<string, string>): Record<string, string> {
   return result;
 }
 
+function detectLegacyKeys(): { file: string; key: string; canonical: string }[] {
+  const issues: { file: string; key: string; canonical: string }[] = [];
+  const globalCfgPath = join(homedir(), ".hindsight", "config");
+  const localCfgPath = join(process.cwd(), ".hindsight", "config");
+  const isHomeDir = process.cwd() === homedir();
+  const files = [globalCfgPath];
+  if (!isHomeDir && existsSync(localCfgPath)) files.push(localCfgPath);
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    const raw = parseConfigFile(file);
+    for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+      if (raw[oldKey] !== undefined && raw[newKey] === undefined) {
+        issues.push({ file, key: oldKey, canonical: newKey });
+      }
+    }
+  }
+  return issues;
+}
+
+function migrateConfigFile(filePath: string): string[] {
+  const migrated: string[] = [];
+  if (!existsSync(filePath)) return migrated;
+  let lines = readFileSync(filePath, "utf-8").split("\n");
+  for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+    const pattern = new RegExp(`^(\\s*)${oldKey}(\\s*=)`);
+    const idx = lines.findIndex(l => pattern.test(l));
+    if (idx >= 0) {
+      // Only migrate if canonical key doesn't already exist
+      const hasCanonical = lines.some(l => new RegExp(`^\\s*${newKey}\\s*=`).test(l));
+      if (!hasCanonical) {
+        lines[idx] = lines[idx].replace(pattern, `$1${newKey}$2`);
+        migrated.push(`${oldKey} → ${newKey}`);
+      }
+    }
+  }
+  if (migrated.length > 0) {
+    writeFileSync(filePath, lines.join("\n"));
+  }
+  return migrated;
+}
+
 function getConfigWithSource(): { global: Record<string, string>; local: Record<string, string>; merged: Record<string, string>; isHomeDir: boolean } {
   const globalCfgPath = join(homedir(), ".hindsight", "config");
   const localCfgPath = join(process.cwd(), ".hindsight", "config");
@@ -309,9 +350,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       if (banks.length === 0) {
         ctx.ui.setStatus("hindsight", "⚠ no active banks");
         log("session_start: no active banks — global_bank not set and homedir_project=false in home dir");
-      } else if (!config.global_bank) {
-        ctx.ui.setStatus("hindsight", "⚠ no global bank");
-        log("session_start: global_bank not configured");
+      }
+      const legacyIssues = detectLegacyKeys();
+      if (legacyIssues.length > 0) {
+        const keys = legacyIssues.map(i => i.key).join(", ");
+        ctx.ui.setStatus("hindsight", `⚠ legacy config: ${keys}`);
+        log(`session_start: legacy keys detected: ${keys}. Run /hindsight doctor to migrate.`);
       }
     }
   });
@@ -776,7 +820,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // Commands
   // -----------------------------------------------------------------------
   pi.registerCommand("hindsight", {
-    description: "Hindsight memory. Usage: /hindsight [status | stats | settings]",
+    description: "Hindsight memory. Usage: /hindsight [status | stats | settings | doctor]",
     handler: async (args: any, ctx) => {
       const config = getConfig();
       if (!config) {
@@ -946,12 +990,49 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (argsStr === "doctor") {
+        const issues = detectLegacyKeys();
+        if (issues.length === 0) {
+          ctx.ui.notify("No issues found. Config is up to date.", "info");
+          return;
+        }
+
+        const summary = issues.map(i => `  ${i.key} \u2192 ${i.canonical} in ${i.file}`).join("\n");
+        ctx.ui.notify(`Legacy config keys found:\n${summary}`, "warning");
+
+        const ok = await ctx.ui.confirm(
+          "Migrate config?",
+          `This will rename legacy keys in your config file(s). The old values are preserved, only the key names change.`
+        );
+        if (!ok) {
+          ctx.ui.notify("Migration skipped. You can edit config files manually.", "info");
+          return;
+        }
+
+        const migrated: string[] = [];
+        const seen = new Set<string>();
+        for (const issue of issues) {
+          if (seen.has(issue.file)) continue;
+          seen.add(issue.file);
+          const result = migrateConfigFile(issue.file);
+          migrated.push(...result.map(r => `${r} in ${issue.file}`));
+        }
+
+        if (migrated.length > 0) {
+          ctx.ui.setStatus("hindsight", undefined);
+          ctx.ui.notify(`Migrated:\n  ${migrated.join("\n  ")}`, "info");
+        } else {
+          ctx.ui.notify("Nothing to migrate.", "info");
+        }
+        return;
+      }
+
       const status = [
         `URL: ${config.api_url || "Not set"}`,
         `Global Bank: ${config.global_bank || "Not set"}`,
         `Project Bank (Recall & Default Retain): ${getProjectBank(config)}`,
         `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
-        `Commands: /hindsight status | stats | settings`,
+        `Commands: /hindsight status | stats | settings | doctor`,
       ].join("\n");
       ctx.ui.notify(status, "info");
     },
