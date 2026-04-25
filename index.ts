@@ -63,7 +63,7 @@ function getConfig(): HindsightConfig | null {
     const localCfgPath = join(process.cwd(), ".hindsight", "config");
     const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
 
-    const merged = { ...global, ...local };
+    const merged = applyAliases({ ...global, ...local });
 
     const recallTypesRaw = merged.recall_types;
     const recall_types = recallTypesRaw
@@ -78,7 +78,7 @@ function getConfig(): HindsightConfig | null {
     return {
       api_url: merged.api_url,
       api_key: merged.api_key,
-      global_bank: merged.global_bank || merged.bank_id,
+      global_bank: merged.global_bank,
       recall_types,
       recall_budget,
       recall_max_tokens,
@@ -110,12 +110,30 @@ function writeConfigValue(filePath: string, key: string, value: string): void {
   writeFileSync(filePath, lines.join("\n") + "\n");
 }
 
+// Legacy key aliases: old_key → canonical_key
+const CONFIG_ALIASES: Record<string, string> = {
+  bank_id: "global_bank",
+  max_tokens: "recall_max_tokens",
+};
+
+function applyAliases(raw: Record<string, string>): Record<string, string> {
+  const result = { ...raw };
+  for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+    if (result[oldKey] !== undefined && result[newKey] === undefined) {
+      result[newKey] = result[oldKey];
+    }
+  }
+  return result;
+}
+
 function getConfigWithSource(): { global: Record<string, string>; local: Record<string, string>; merged: Record<string, string>; isHomeDir: boolean } {
   const globalCfgPath = join(homedir(), ".hindsight", "config");
   const localCfgPath = join(process.cwd(), ".hindsight", "config");
   const isHomeDir = process.cwd() === homedir();
-  const global = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
-  const local = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
+  const globalRaw = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
+  const localRaw = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
+  const global = applyAliases(globalRaw);
+  const local = applyAliases(localRaw);
   return { global, local, merged: { ...global, ...local }, isHomeDir };
 }
 
