@@ -63,6 +63,31 @@ That's it. Memory is fully automatic from here: recall before each turn, retain 
 - `#global` or `#me`: also retain this turn to your global bank (cross-project learnings).
 - `#architecture`, `#bug`, etc.: custom tags extracted and attached to memory for filtering.
 
+### Project-level opt-out
+
+Disable memory for specific projects by setting `recall_enabled` and `retain_enabled` to `false` in a project-level `.hindsight/config`:
+
+```toml
+recall_enabled = false
+retain_enabled = false
+```
+
+Or use the interactive `/hindsight settings` command.
+
+Manual tools (`hindsight_recall`, `hindsight_retain`, `hindsight_reflect`) remain available regardless.
+
+### Home directory handling
+
+When Pi runs from your home directory, the global config (`~/.hindsight/config`) and local config (`.hindsight/config` in CWD) are the same file. This means a `project-<username>` bank is created alongside your global bank, causing duplicate recall and retain.
+
+To fix this, set `homedir_project = false` in your global config:
+
+```toml
+homedir_project = false
+```
+
+With this set, sessions started from the home directory use only the global bank. All other project directories are unaffected.
+
 ### In-chat visibility
 
 | Event | What you see |
@@ -109,6 +134,9 @@ recall_max_tokens = 512
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
+| `recall_enabled` | `true` | Enable automatic recall before agent turns. Set `false` to disable auto-recall for this project. Manual `hindsight_recall` tool still works. |
+| `retain_enabled` | `true` | Enable automatic retain after agent turns. Set `false` to disable auto-retain for this project. Manual `hindsight_retain` tool still works. |
+| `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. |
 | `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, this bank is queried alongside the project bank on every recall. Turns tagged `#global` or `#me` are also retained here. Leave unset if you only want per-project memory. |
 
 ## Commands
@@ -134,8 +162,21 @@ Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)
 ### `/hindsight stats`
 Memory, entity, and document counts for all active banks.
 
-### `/hindsight config`
-Show current effective configuration.
+### `/hindsight settings`
+Interactive settings menu. View all current settings with their source (global, project, or default), toggle boolean settings, edit text values, and choose where to save (project or global config). When running from the home directory, saves go to global config only.
+
+Use this to opt out a project from memory:
+```
+/hindsight settings
+→ Auto-Recall: true [default]  →  toggle Off  →  save to Project
+→ Auto-Retain: true [default]  →  toggle Off  →  save to Project
+```
+
+Or to disable home directory as a project:
+```
+/hindsight settings
+→ Home Dir as Project: true [default]  →  toggle Off
+```
 
 ## Banks
 
@@ -232,7 +273,7 @@ This section aims to help you pick the right one. Both are good.
 
 | Dimension | **pi-hindsight** | **@walodayeet/hindsight-pi** |
 |---|---|---|
-| Opt-out | `#nomem` or `#skip` to skip retain | Not available |
+| Opt-out | `#nomem`/`#skip` per-prompt, `recall_enabled`/`retain_enabled` per-project | Not available |
 | Global bank routing | `#global` or `#me` per prompt | Configured at bank strategy level |
 | Custom tags | `#hashtags` in prompt attached to memory | Automatic metadata tags (source, workspace, kind) |
 | Trivial prompt skip | Yes | Yes, plus meta-memory query filtering |
@@ -252,7 +293,7 @@ This section aims to help you pick the right one. Both are good.
 | Setup experience  | Manual: edit config file, run `/hindsight status`           | Interactive: `/hindsight:setup` wizard                                                |
 | Diagnostics       | `/hindsight status` (health + hooks + log tail)             | `/hindsight:doctor` (preflight), `/hindsight:status` (runtime)                        |
 | Manual tools      | `hindsight_recall`, `hindsight_retain`, `hindsight_reflect` | `hindsight_search`, `hindsight_context`, `hindsight_retain`, `hindsight_bank_profile` |
-| Commands          | 3 (`status`, `stats`, `config`)                             | 10+ (setup, settings, doctor, where, sync, map, mode, config, connect, stats)         |
+| Commands          | 3 (`status`, `stats`, `settings`)                             | 10+ (setup, settings, doctor, where, sync, map, mode, config, connect, stats)         |
 | Performance docs  | Benchmarks, latency analysis, Supabase index guide          | Not included                                                                          |
 
 **What the differences mean:**
@@ -277,6 +318,7 @@ This extension uses raw `fetch` calls against the Hindsight REST API, no SDK dep
 ### When to choose this extension
 
 - You want a single-file, low-overhead setup with minimal config.
+- Per-project opt-out matters: disable memory for specific projects or your home directory via config or `/hindsight settings`.
 - Per-prompt memory controls matter: `#nomem` to skip, `#global` to route, `#tags` to annotate.
 - You prefer full transcript retention with append-mode documents over turn summaries.
 - You want `hindsight_reflect` for server-side memory synthesis.

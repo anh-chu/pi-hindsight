@@ -5,7 +5,7 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
@@ -38,6 +38,9 @@ interface HindsightConfig {
   recall_budget?: string;
   recall_max_tokens?: number;
   async_retain?: boolean;
+  recall_enabled?: boolean;
+  retain_enabled?: boolean;
+  homedir_project?: boolean;
 }
 
 function parseConfigFile(filePath: string): Record<string, string> {
@@ -69,6 +72,9 @@ function getConfig(): HindsightConfig | null {
     const recall_budget = merged.recall_budget || "mid";
     const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
     const async_retain = merged.async_retain === "false" ? false : true;
+    const recall_enabled = merged.recall_enabled === "false" ? false : true;
+    const retain_enabled = merged.retain_enabled === "false" ? false : true;
+    const homedir_project = merged.homedir_project === "false" ? false : true;
     return {
       api_url: merged.api_url,
       api_key: merged.api_key,
@@ -77,27 +83,70 @@ function getConfig(): HindsightConfig | null {
       recall_budget,
       recall_max_tokens,
       async_retain,
+      recall_enabled,
+      retain_enabled,
+      homedir_project,
     };
   } catch (e) {
     return null;
   }
 }
 
+function writeConfigValue(filePath: string, key: string, value: string): void {
+  mkdirSync(join(filePath, ".."), { recursive: true });
+  let lines: string[] = [];
+  if (existsSync(filePath)) {
+    lines = readFileSync(filePath, "utf-8").split("\n");
+  }
+  const pattern = new RegExp(`^\\s*${key}\\s*=`);
+  const idx = lines.findIndex(l => pattern.test(l));
+  const newLine = `${key} = "${value}"`;
+  if (idx >= 0) {
+    lines[idx] = newLine;
+  } else {
+    while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+    lines.push(newLine);
+  }
+  writeFileSync(filePath, lines.join("\n") + "\n");
+}
+
+function getConfigWithSource(): { global: Record<string, string>; local: Record<string, string>; merged: Record<string, string>; isHomeDir: boolean } {
+  const globalCfgPath = join(homedir(), ".hindsight", "config");
+  const localCfgPath = join(process.cwd(), ".hindsight", "config");
+  const isHomeDir = process.cwd() === homedir();
+  const global = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
+  const local = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
+  return { global, local, merged: { ...global, ...local }, isHomeDir };
+}
+
 function getProjectBank(): string {
   return `project-${basename(process.cwd())}`;
+}
+
+function isHomeDirSession(): boolean {
+  return process.cwd() === homedir();
 }
 
 function getRecallBanks(config: HindsightConfig): string[] {
   const banks = new Set<string>();
   if (config.global_bank) banks.add(config.global_bank);
-  banks.add(getProjectBank());
+  // Skip project bank in homedir when homedir_project is disabled
+  if (!(isHomeDirSession() && config.homedir_project === false)) {
+    banks.add(getProjectBank());
+  }
   return Array.from(banks);
 }
 
 function getRetainBanks(config: HindsightConfig, prompt: string): string[] {
   const banks = new Set<string>();
-  banks.add(getProjectBank());
-  
+  const skipProject = isHomeDirSession() && config.homedir_project === false;
+  if (!skipProject) {
+    banks.add(getProjectBank());
+  } else if (config.global_bank) {
+    // In homedir with project disabled, retain to global bank instead
+    banks.add(config.global_bank);
+  }
+
   // Opt-in for global bank retention
   if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
     banks.add(config.global_bank);
@@ -111,8 +160,8 @@ function getLastUserMessage(ctx: any, fallbackPrompt: string): string {
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
       if (e.type === "message" && e.message?.role === "user") {
-        return typeof e.message.content === "string" 
-          ? e.message.content 
+        return typeof e.message.content === "string"
+          ? e.message.content
           : JSON.stringify(e.message.content);
       }
     }
@@ -204,7 +253,7 @@ function readRecentLogErrors(maxLines = 20): string[] {
   }
 }
 const OPERATIONAL_TOOLS = [
-  "bash", "nu", "process", "read", "write", "edit", 
+  "bash", "nu", "process", "read", "write", "edit",
   "grep", "ast_grep_search", "ast_grep_replace", "lsp_navigation"
 ];
 
@@ -234,6 +283,16 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     ctx.ui.setStatus("hindsight", undefined);
     log("session_start: state reset");
     const config = getConfig();
+    if (config) {
+      const banks = getRecallBanks(config);
+      if (banks.length === 0) {
+        ctx.ui.setStatus("hindsight", "⚠ no active banks");
+        log("session_start: no active banks — global_bank not set and homedir_project=false in home dir");
+      } else if (!config.global_bank) {
+        ctx.ui.setStatus("hindsight", "⚠ no global bank");
+        log("session_start: global_bank not configured");
+      }
+    }
   });
 
   pi.on("session_compact", async (_event, ctx) => {
@@ -267,7 +326,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   pi.registerMessageRenderer("hindsight-retain-failed", (_message, _options, theme) => {
     let text = theme.fg("error", "💾 Hindsight");
-    text += theme.fg("muted", " retain failed — use ");
+    text += theme.fg("muted", " retain failed - use ");
     text += theme.fg("accent", "hindsight_retain");
     text += theme.fg("muted", " to save manually");
     return new Text(text, 0, 0);
@@ -398,8 +457,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     const config = getConfig();
     if (!config || !config.api_url) {
       log("before_agent_start: no config, giving up");
-      recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry — config won't change mid-session
+      recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry - config won't change mid-session
       ctx.ui.setStatus("hindsight", "⚠ not configured");
+      return;
+    }
+
+    if (config.recall_enabled === false) {
+      log("before_agent_start: recall disabled by config");
+      recallDone = true;
       return;
     }
 
@@ -439,7 +504,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       if (authFailed) {
         hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
         recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
-        ctx.ui.setStatus("hindsight", "✗ auth error — check api_key");
+        ctx.ui.setStatus("hindsight", "✗ auth error - check api_key");
         log("before_agent_start: auth error, giving up");
         return;
       }
@@ -495,6 +560,11 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       return;
     }
 
+    if (config.retain_enabled === false) {
+      log("agent_end: retain disabled by config");
+      return;
+    }
+
     const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
     const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
     if (!lastUserPrompt) {
@@ -538,7 +608,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         }
       }
     }
-    
+
     transcript += `[assistant:end]`;
     // Extract explicit #tags from the user prompt (ignoring our reserved control tags)
     const reservedTags = new Set(["nomem", "skip", "global", "me"]);
@@ -598,13 +668,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
         };
         if (allFailed) {
-          log("agent_end: async retain — all banks failed");
+          log("agent_end: async retain - all banks failed");
           pi.sendMessage(
             { customType: "hindsight-retain-failed", content: "", display: true },
             { deliverAs: "nextTurn" }
           );
         } else {
-          log(`agent_end: async retain — succeeded banks=${succeededBanks.join(",")}`);
+          log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
           pi.sendMessage(
             { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
             { deliverAs: "nextTurn" }
@@ -654,7 +724,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
       };
       if (allFailed) {
-        log("agent_end: all banks failed — sending next-turn notification");
+        log("agent_end: all banks failed - sending next-turn notification");
         ctx.ui.setStatus("hindsight", "⚠ retain failed");
         pi.sendMessage(
           {
@@ -685,7 +755,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // Commands
   // -----------------------------------------------------------------------
   pi.registerCommand("hindsight", {
-    description: "Show Hindsight status. Usage: /hindsight [status | stats | config]",
+    description: "Hindsight memory. Usage: /hindsight [status | stats | settings]",
     handler: async (args: any, ctx) => {
       const config = getConfig();
       if (!config) {
@@ -715,7 +785,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         lines.push(`Bank:   ${bank}`);
         const bankCheck = await checkBankConfig(config, bank);
         if (!bankCheck.ok) {
-          lines.push(`  ✗ ${bankCheck.authError ? "auth invalid — check api_key" : "bank unreachable"}`);
+          lines.push(`  ✗ ${bankCheck.authError ? "auth invalid - check api_key" : "bank unreachable"}`);
           hasError = true;
         } else {
           lines.push(`  ✓ auth ok`);
@@ -725,7 +795,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         // Hook state
         lines.push("");
         lines.push("Hooks this session:");
-        const hookIcon = (r?: string) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "−" : "…";
+        const hookIcon = (r?: string) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "-" : "...";
         const fmtHook = (h: HookRecord) =>
           h.firedAt ? `${hookIcon(h.result)} ${h.result}${h.detail ? ` (${h.detail})` : ""}` : "not fired";
         lines.push(`  session_start:      ${fmtHook(hookStats.sessionStart)}`);
@@ -763,12 +833,103 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         ctx.ui.notify(lines.join("\n\n"), "info");
         return;
       }
+
+      if (argsStr === "settings") {
+        const globalCfgPath = join(homedir(), ".hindsight", "config");
+        const localCfgPath = join(process.cwd(), ".hindsight", "config");
+        let cfg = getConfigWithSource();
+        const isHomeDir = cfg.isHomeDir;
+
+        const settingsMeta = [
+          { key: "api_url", label: "API URL", isBool: false, default: "(required)" },
+          { key: "api_key", label: "API Key", isBool: false, default: "(required)" },
+          { key: "global_bank", label: "Global Bank", isBool: false, default: "(not set)" },
+          { key: "recall_enabled", label: "Auto-Recall", isBool: true, default: "true" },
+          { key: "retain_enabled", label: "Auto-Retain", isBool: true, default: "true" },
+          { key: "async_retain", label: "Async Retain", isBool: true, default: "true" },
+          { key: "homedir_project", label: "Home Dir as Project", isBool: true, default: "true" },
+          { key: "recall_types", label: "Recall Types", isBool: false, default: "observation" },
+          { key: "recall_budget", label: "Recall Budget", isBool: false, default: "mid" },
+          { key: "recall_max_tokens", label: "Max Tokens", isBool: false, default: "(default)" },
+        ];
+
+        const DONE_LABEL = "← Done";
+
+        const buildOptions = () => {
+          const options: string[] = [];
+          if (isHomeDir) options.push("⚠ CWD is home dir - all saves go to global config");
+          for (const s of settingsMeta) {
+            const val = cfg.merged[s.key] ?? s.default;
+            const src = cfg.local[s.key] !== undefined ? "project" : cfg.global[s.key] !== undefined ? "global" : "default";
+            options.push(`${s.label}: ${s.key === "api_key" && val !== s.default ? "****" : val} [${src}]`);
+          }
+          options.push(DONE_LABEL);
+          return options;
+        };
+
+        while (true) {
+          const options = buildOptions();
+          const choice = await ctx.ui.select("Hindsight Settings", options);
+          if (!choice || choice === DONE_LABEL || choice.startsWith("⚠")) {
+            if (choice?.startsWith("⚠")) continue;
+            break;
+          }
+
+          // Find which setting was picked
+          const selected = settingsMeta.find(s => choice.startsWith(s.label + ":"));
+          if (!selected) continue;
+
+          const currentVal = cfg.merged[selected.key];
+          let newValue: string | undefined;
+
+          if (selected.isBool) {
+            // Toggle boolean
+            const curBool = currentVal !== "false";
+            const toggleChoice = await ctx.ui.select(
+              `${selected.label} (currently ${curBool ? "on" : "off"})`,
+              ["On", "Off", "← Cancel"]
+            );
+            if (!toggleChoice || toggleChoice === "← Cancel") continue;
+            newValue = toggleChoice === "On" ? "true" : "false";
+          } else {
+            // Text input
+            const inputVal = await ctx.ui.input(
+              `${selected.label}:`,
+              currentVal || ""
+            );
+            if (inputVal === undefined || inputVal === "") continue;
+            newValue = inputVal;
+          }
+
+          // Determine save target
+          let saveGlobal = true;
+          let saveLocal = false;
+          if (!isHomeDir) {
+            const target = await ctx.ui.select(
+              `Save ${selected.label} to:`,
+              ["Project (.hindsight/config)", "Global (~/.hindsight/config)", "← Cancel"]
+            );
+            if (!target || target === "← Cancel") continue;
+            saveGlobal = target.startsWith("Global");
+            saveLocal = target.startsWith("Project");
+          }
+
+          if (saveGlobal) writeConfigValue(globalCfgPath, selected.key, newValue);
+          if (saveLocal) writeConfigValue(localCfgPath, selected.key, newValue);
+
+          // Refresh merged view
+          cfg = getConfigWithSource();
+          ctx.ui.notify(`${selected.label} → ${selected.key === "api_key" ? "****" : newValue}`, "info");
+        }
+        return;
+      }
+
       const status = [
         `URL: ${config.api_url || "Not set"}`,
         `Global Bank: ${config.global_bank || "Not set"}`,
         `Project Bank (Recall & Default Retain): ${getProjectBank()}`,
         `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
-        `Commands: /hindsight status | stats | mission [text]`,
+        `Commands: /hindsight status | stats | settings`,
       ].join("\n");
       ctx.ui.notify(status, "info");
     },
