@@ -204,10 +204,8 @@ function getRetainBanks(config: HindsightConfig, prompt: string): string[] {
   const skipProject = isHomeDirSession() && config.homedir_project === false;
   if (!skipProject) {
     banks.add(getProjectBank(config));
-  } else if (config.global_bank) {
-    // In homedir with project disabled, retain to global bank instead
-    banks.add(config.global_bank);
   }
+  // When homedir_project=false, skip auto-retain entirely — explicit hindsight_retain still works
 
   // Opt-in for global bank retention
   if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
@@ -465,7 +463,11 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const config = getConfig();
       if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
 
-      const bank = getProjectBank(config);
+      const isHomeDirNoProject = isHomeDirSession() && config.homedir_project === false;
+      const bank = isHomeDirNoProject
+        ? (config.global_bank ?? null)
+        : getProjectBank(config);
+      if (!bank) return { content: [{ type: "text" as const, text: "Hindsight: no bank available. Set global_bank in ~/.hindsight/config." }], details: {}, isError: true };
       try {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
           method: "POST",

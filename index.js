@@ -3,7 +3,7 @@
  * Fully autonomous memory via lifecycle hooks.
  */
 import { Text } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
@@ -41,35 +41,145 @@ function getConfig() {
         // Project-level override: .hindsight/config in CWD
         const localCfgPath = join(process.cwd(), ".hindsight", "config");
         const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
-        const merged = { ...global, ...local };
+        const merged = applyAliases({ ...global, ...local });
         const recallTypesRaw = merged.recall_types;
         const recall_types = recallTypesRaw
             ? recallTypesRaw.split(",").map((t) => t.trim()).filter(Boolean)
             : ["observation"];
+        const recall_budget = merged.recall_budget || "mid";
+        const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
+        const async_retain = merged.async_retain === "false" ? false : true;
+        const recall_enabled = merged.recall_enabled === "false" ? false : true;
+        const retain_enabled = merged.retain_enabled === "false" ? false : true;
+        const homedir_project = merged.homedir_project === "false" ? false : true;
         return {
             api_url: merged.api_url,
             api_key: merged.api_key,
-            global_bank: merged.global_bank || merged.bank_id,
+            global_bank: merged.global_bank,
+            project_bank_id: merged.project_bank_id,
             recall_types,
+            recall_budget,
+            recall_max_tokens,
+            async_retain,
+            recall_enabled,
+            retain_enabled,
+            homedir_project,
         };
     }
     catch (e) {
         return null;
     }
 }
-function getProjectBank() {
+function writeConfigValue(filePath, key, value) {
+    mkdirSync(join(filePath, ".."), { recursive: true });
+    let lines = [];
+    if (existsSync(filePath)) {
+        lines = readFileSync(filePath, "utf-8").split("\n");
+    }
+    const pattern = new RegExp(`^\\s*${key}\\s*=`);
+    const idx = lines.findIndex(l => pattern.test(l));
+    const newLine = `${key} = "${value}"`;
+    if (idx >= 0) {
+        lines[idx] = newLine;
+    }
+    else {
+        while (lines.length > 0 && lines[lines.length - 1].trim() === "")
+            lines.pop();
+        lines.push(newLine);
+    }
+    writeFileSync(filePath, lines.join("\n") + "\n");
+}
+// Legacy key aliases: old_key → canonical_key
+const CONFIG_ALIASES = {
+    bank_id: "global_bank",
+    max_tokens: "recall_max_tokens",
+};
+function applyAliases(raw) {
+    const result = { ...raw };
+    for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+        if (result[oldKey] !== undefined && result[newKey] === undefined) {
+            result[newKey] = result[oldKey];
+        }
+    }
+    return result;
+}
+function detectLegacyKeys() {
+    const issues = [];
+    const globalCfgPath = join(homedir(), ".hindsight", "config");
+    const localCfgPath = join(process.cwd(), ".hindsight", "config");
+    const isHomeDir = process.cwd() === homedir();
+    const files = [globalCfgPath];
+    if (!isHomeDir && existsSync(localCfgPath))
+        files.push(localCfgPath);
+    for (const file of files) {
+        if (!existsSync(file))
+            continue;
+        const raw = parseConfigFile(file);
+        for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+            if (raw[oldKey] !== undefined && raw[newKey] === undefined) {
+                issues.push({ file, key: oldKey, canonical: newKey });
+            }
+        }
+    }
+    return issues;
+}
+function migrateConfigFile(filePath) {
+    const migrated = [];
+    if (!existsSync(filePath))
+        return migrated;
+    let lines = readFileSync(filePath, "utf-8").split("\n");
+    for (const [oldKey, newKey] of Object.entries(CONFIG_ALIASES)) {
+        const pattern = new RegExp(`^(\\s*)${oldKey}(\\s*=)`);
+        const idx = lines.findIndex(l => pattern.test(l));
+        if (idx >= 0) {
+            // Only migrate if canonical key doesn't already exist
+            const hasCanonical = lines.some(l => new RegExp(`^\\s*${newKey}\\s*=`).test(l));
+            if (!hasCanonical) {
+                lines[idx] = lines[idx].replace(pattern, `$1${newKey}$2`);
+                migrated.push(`${oldKey} → ${newKey}`);
+            }
+        }
+    }
+    if (migrated.length > 0) {
+        writeFileSync(filePath, lines.join("\n"));
+    }
+    return migrated;
+}
+function getConfigWithSource() {
+    const globalCfgPath = join(homedir(), ".hindsight", "config");
+    const localCfgPath = join(process.cwd(), ".hindsight", "config");
+    const isHomeDir = process.cwd() === homedir();
+    const globalRaw = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
+    const localRaw = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
+    const global = applyAliases(globalRaw);
+    const local = applyAliases(localRaw);
+    return { global, local, merged: { ...global, ...local }, isHomeDir };
+}
+function getProjectBank(config) {
+    if (config?.project_bank_id)
+        return config.project_bank_id;
     return `project-${basename(process.cwd())}`;
+}
+function isHomeDirSession() {
+    return process.cwd() === homedir();
 }
 function getRecallBanks(config) {
     const banks = new Set();
     if (config.global_bank)
         banks.add(config.global_bank);
-    banks.add(getProjectBank());
+    // Skip project bank in homedir when homedir_project is disabled
+    if (!(isHomeDirSession() && config.homedir_project === false)) {
+        banks.add(getProjectBank(config));
+    }
     return Array.from(banks);
 }
 function getRetainBanks(config, prompt) {
     const banks = new Set();
-    banks.add(getProjectBank());
+    const skipProject = isHomeDirSession() && config.homedir_project === false;
+    if (!skipProject) {
+        banks.add(getProjectBank(config));
+    }
+    // When homedir_project=false, skip auto-retain entirely — explicit hindsight_retain still works
     // Opt-in for global bank retention
     if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
         banks.add(config.global_bank);
@@ -192,6 +302,24 @@ export default function hindsightExtension(pi) {
         ctx.ui.setStatus("hindsight", undefined);
         log("session_start: state reset");
         const config = getConfig();
+        if (config) {
+            const banks = getRecallBanks(config);
+            if (banks.length === 0) {
+                ctx.ui.setStatus("hindsight", "⚠ no banks — /hindsight settings to configure");
+                ctx.ui.notify("Hindsight has no active banks. Memory recall and retain are disabled.\n" +
+                    "\n" +
+                    "Fix: run /hindsight settings and set global_bank, or set homedir_project = true.", "warning");
+                log("session_start: no active banks — global_bank not set and homedir_project=false in home dir");
+            }
+            const legacyIssues = detectLegacyKeys();
+            if (legacyIssues.length > 0) {
+                const keys = legacyIssues.map(i => `${i.key} → ${i.canonical}`).join(", ");
+                ctx.ui.setStatus("hindsight", "⚠ outdated config — run /hindsight doctor");
+                ctx.ui.notify(`Your config uses deprecated keys: ${keys}\n` +
+                    "Run /hindsight doctor to auto-migrate, or update manually.", "warning");
+                log(`session_start: legacy keys detected: ${keys}`);
+            }
+        }
     });
     pi.on("session_compact", async (_event, ctx) => {
         recallDone = false;
@@ -220,7 +348,7 @@ export default function hindsightExtension(pi) {
     });
     pi.registerMessageRenderer("hindsight-retain-failed", (_message, _options, theme) => {
         let text = theme.fg("error", "💾 Hindsight");
-        text += theme.fg("muted", " retain failed — use ");
+        text += theme.fg("muted", " retain failed - use ");
         text += theme.fg("accent", "hindsight_retain");
         text += theme.fg("muted", " to save manually");
         return new Text(text, 0, 0);
@@ -243,13 +371,16 @@ export default function hindsightExtension(pi) {
             const banks = getRecallBanks(config);
             try {
                 const recallPromises = banks.map(async (bank) => {
+                    const reqBody = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
+                    if (config.recall_max_tokens !== undefined)
+                        reqBody.max_tokens = config.recall_max_tokens;
                     const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
                             "Authorization": `Bearer ${config.api_key || ""}`
                         },
-                        body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
+                        body: JSON.stringify(reqBody)
                     });
                     if (!res.ok)
                         return [];
@@ -280,7 +411,12 @@ export default function hindsightExtension(pi) {
             const config = getConfig();
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
-            const bank = getProjectBank();
+            const isHomeDirNoProject = isHomeDirSession() && config.homedir_project === false;
+            const bank = isHomeDirNoProject
+                ? (config.global_bank ?? null)
+                : getProjectBank(config);
+            if (!bank)
+                return { content: [{ type: "text", text: "Hindsight: no bank available. Set global_bank in ~/.hindsight/config." }], details: {}, isError: true };
             try {
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
                     method: "POST",
@@ -311,7 +447,7 @@ export default function hindsightExtension(pi) {
             const config = getConfig();
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
-            const bank = getProjectBank();
+            const bank = getProjectBank(config);
             try {
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
                     method: "POST",
@@ -347,8 +483,13 @@ export default function hindsightExtension(pi) {
         const config = getConfig();
         if (!config || !config.api_url) {
             log("before_agent_start: no config, giving up");
-            recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry — config won't change mid-session
+            recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry - config won't change mid-session
             ctx.ui.setStatus("hindsight", "⚠ not configured");
+            return;
+        }
+        if (config.recall_enabled === false) {
+            log("before_agent_start: recall disabled by config");
+            recallDone = true;
             return;
         }
         const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
@@ -358,13 +499,16 @@ export default function hindsightExtension(pi) {
             let anyBankSucceeded = false;
             let authFailed = false;
             const recallPromises = banks.map(async (bank) => {
+                const reqBody = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
+                if (config.recall_max_tokens !== undefined)
+                    reqBody.max_tokens = config.recall_max_tokens;
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${config.api_key || ""}`
                     },
-                    body: JSON.stringify({ query: lastUserPrompt, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
+                    body: JSON.stringify(reqBody)
                 });
                 if (!res.ok) {
                     log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
@@ -382,7 +526,7 @@ export default function hindsightExtension(pi) {
             if (authFailed) {
                 hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
                 recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
-                ctx.ui.setStatus("hindsight", "✗ auth error — check api_key");
+                ctx.ui.setStatus("hindsight", "✗ auth error - check api_key");
                 log("before_agent_start: auth error, giving up");
                 return;
             }
@@ -436,6 +580,10 @@ export default function hindsightExtension(pi) {
         const config = getConfig();
         if (!config || !config.api_url) {
             log("agent_end: no config, skipping");
+            return;
+        }
+        if (config.retain_enabled === false) {
+            log("agent_end: retain disabled by config");
             return;
         }
         const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
@@ -494,8 +642,57 @@ export default function hindsightExtension(pi) {
         if (transcript.length > 50000) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
+        const banks = getRetainBanks(config, lastUserPrompt);
+        // Async retain: fire and forget, don't block
+        if (config.async_retain !== false) {
+            log("agent_end: async retain fired (not awaiting)");
+            const retainPromise = Promise.allSettled(banks.map(async (bank) => {
+                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${config.api_key || ""}`
+                    },
+                    body: JSON.stringify({
+                        items: [{
+                                content: transcript,
+                                document_id: `session-${sessionId}`,
+                                update_mode: "append",
+                                context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
+                                timestamp: new Date().toISOString(),
+                                ...(extractedTags.length > 0 && { tags: extractedTags })
+                            }],
+                        async: true
+                    })
+                });
+                log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
+                if (!res.ok)
+                    throw new Error(`HTTP ${res.status}`);
+                return bank;
+            }));
+            retainPromise.then((results) => {
+                const succeededBanks = results
+                    .filter(r => r.status === "fulfilled")
+                    .map(r => r.value);
+                const allFailed = succeededBanks.length === 0;
+                hookStats.retain = {
+                    firedAt: new Date().toISOString(),
+                    result: allFailed ? "failed" : "ok",
+                    detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+                };
+                if (allFailed) {
+                    log("agent_end: async retain - all banks failed");
+                    pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+                }
+                else {
+                    log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
+                    pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
+                }
+            });
+            return;
+        }
+        // Sync retain (original behavior)
         try {
-            const banks = getRetainBanks(config, lastUserPrompt);
             log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
             const results = await Promise.allSettled(banks.map(async (bank) => {
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
@@ -531,7 +728,7 @@ export default function hindsightExtension(pi) {
                 detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
             };
             if (allFailed) {
-                log("agent_end: all banks failed — sending next-turn notification");
+                log("agent_end: all banks failed - sending next-turn notification");
                 ctx.ui.setStatus("hindsight", "⚠ retain failed");
                 pi.sendMessage({
                     customType: "hindsight-retain-failed",
@@ -557,7 +754,7 @@ export default function hindsightExtension(pi) {
     // Commands
     // -----------------------------------------------------------------------
     pi.registerCommand("hindsight", {
-        description: "Show Hindsight status. Usage: /hindsight [status | stats | config]",
+        description: "Hindsight memory. Usage: /hindsight [status | stats | settings | doctor]",
         handler: async (args, ctx) => {
             const config = getConfig();
             if (!config) {
@@ -583,11 +780,11 @@ export default function hindsightExtension(pi) {
                 if (!health.ok)
                     hasError = true;
                 // Project bank: auth + mission
-                const bank = getProjectBank();
+                const bank = getProjectBank(config);
                 lines.push(`Bank:   ${bank}`);
                 const bankCheck = await checkBankConfig(config, bank);
                 if (!bankCheck.ok) {
-                    lines.push(`  ✗ ${bankCheck.authError ? "auth invalid — check api_key" : "bank unreachable"}`);
+                    lines.push(`  ✗ ${bankCheck.authError ? "auth invalid - check api_key" : "bank unreachable"}`);
                     hasError = true;
                 }
                 else {
@@ -598,7 +795,7 @@ export default function hindsightExtension(pi) {
                 // Hook state
                 lines.push("");
                 lines.push("Hooks this session:");
-                const hookIcon = (r) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "−" : "…";
+                const hookIcon = (r) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "-" : "...";
                 const fmtHook = (h) => h.firedAt ? `${hookIcon(h.result)} ${h.result}${h.detail ? ` (${h.detail})` : ""}` : "not fired";
                 lines.push(`  session_start:      ${fmtHook(hookStats.sessionStart)}`);
                 lines.push(`  recall:             ${fmtHook(hookStats.recall)}`);
@@ -633,12 +830,123 @@ export default function hindsightExtension(pi) {
                 ctx.ui.notify(lines.join("\n\n"), "info");
                 return;
             }
+            if (argsStr === "settings") {
+                const globalCfgPath = join(homedir(), ".hindsight", "config");
+                const localCfgPath = join(process.cwd(), ".hindsight", "config");
+                let cfg = getConfigWithSource();
+                const isHomeDir = cfg.isHomeDir;
+                const settingsMeta = [
+                    { key: "api_url", label: "API URL", isBool: false, default: "(required)" },
+                    { key: "api_key", label: "API Key", isBool: false, default: "(required)" },
+                    { key: "global_bank", label: "Global Bank", isBool: false, default: "(not set)" },
+                    { key: "project_bank_id", label: "Project Bank Override", isBool: false, default: "(auto)" },
+                    { key: "recall_enabled", label: "Auto-Recall", isBool: true, default: "true" },
+                    { key: "retain_enabled", label: "Auto-Retain", isBool: true, default: "true" },
+                    { key: "async_retain", label: "Async Retain", isBool: true, default: "true" },
+                    { key: "homedir_project", label: "Home Dir as Project", isBool: true, default: "true" },
+                    { key: "recall_types", label: "Recall Types", isBool: false, default: "observation" },
+                    { key: "recall_budget", label: "Recall Budget", isBool: false, default: "mid" },
+                    { key: "recall_max_tokens", label: "Max Tokens", isBool: false, default: "(default)" },
+                ];
+                const DONE_LABEL = "← Done";
+                const buildOptions = () => {
+                    const options = [];
+                    if (isHomeDir)
+                        options.push("⚠ CWD is home dir - all saves go to global config");
+                    for (const s of settingsMeta) {
+                        const val = cfg.merged[s.key] ?? s.default;
+                        const src = cfg.local[s.key] !== undefined ? "project" : cfg.global[s.key] !== undefined ? "global" : "default";
+                        options.push(`${s.label}: ${s.key === "api_key" && val !== s.default ? "****" : val} [${src}]`);
+                    }
+                    options.push(DONE_LABEL);
+                    return options;
+                };
+                while (true) {
+                    const options = buildOptions();
+                    const choice = await ctx.ui.select("Hindsight Settings", options);
+                    if (!choice || choice === DONE_LABEL || choice.startsWith("⚠")) {
+                        if (choice?.startsWith("⚠"))
+                            continue;
+                        break;
+                    }
+                    // Find which setting was picked
+                    const selected = settingsMeta.find(s => choice.startsWith(s.label + ":"));
+                    if (!selected)
+                        continue;
+                    const currentVal = cfg.merged[selected.key];
+                    let newValue;
+                    if (selected.isBool) {
+                        // Toggle boolean
+                        const curBool = currentVal !== "false";
+                        const toggleChoice = await ctx.ui.select(`${selected.label} (currently ${curBool ? "on" : "off"})`, ["On", "Off", "← Cancel"]);
+                        if (!toggleChoice || toggleChoice === "← Cancel")
+                            continue;
+                        newValue = toggleChoice === "On" ? "true" : "false";
+                    }
+                    else {
+                        // Text input
+                        const inputVal = await ctx.ui.input(`${selected.label}:`, currentVal || "");
+                        if (inputVal === undefined || inputVal === "")
+                            continue;
+                        newValue = inputVal;
+                    }
+                    // Determine save target
+                    let saveGlobal = true;
+                    let saveLocal = false;
+                    if (!isHomeDir) {
+                        const target = await ctx.ui.select(`Save ${selected.label} to:`, ["Project (.hindsight/config)", "Global (~/.hindsight/config)", "← Cancel"]);
+                        if (!target || target === "← Cancel")
+                            continue;
+                        saveGlobal = target.startsWith("Global");
+                        saveLocal = target.startsWith("Project");
+                    }
+                    if (saveGlobal)
+                        writeConfigValue(globalCfgPath, selected.key, newValue);
+                    if (saveLocal)
+                        writeConfigValue(localCfgPath, selected.key, newValue);
+                    // Refresh merged view
+                    cfg = getConfigWithSource();
+                    ctx.ui.notify(`${selected.label} → ${selected.key === "api_key" ? "****" : newValue}`, "info");
+                }
+                return;
+            }
+            if (argsStr === "doctor") {
+                const issues = detectLegacyKeys();
+                if (issues.length === 0) {
+                    ctx.ui.notify("No issues found. Config is up to date.", "info");
+                    return;
+                }
+                const summary = issues.map(i => `  ${i.key} \u2192 ${i.canonical} in ${i.file}`).join("\n");
+                ctx.ui.notify(`Legacy config keys found:\n${summary}`, "warning");
+                const ok = await ctx.ui.confirm("Migrate config?", `This will rename legacy keys in your config file(s). The old values are preserved, only the key names change.`);
+                if (!ok) {
+                    ctx.ui.notify("Migration skipped. You can edit config files manually.", "info");
+                    return;
+                }
+                const migrated = [];
+                const seen = new Set();
+                for (const issue of issues) {
+                    if (seen.has(issue.file))
+                        continue;
+                    seen.add(issue.file);
+                    const result = migrateConfigFile(issue.file);
+                    migrated.push(...result.map(r => `${r} in ${issue.file}`));
+                }
+                if (migrated.length > 0) {
+                    ctx.ui.setStatus("hindsight", undefined);
+                    ctx.ui.notify(`Migrated:\n  ${migrated.join("\n  ")}`, "info");
+                }
+                else {
+                    ctx.ui.notify("Nothing to migrate.", "info");
+                }
+                return;
+            }
             const status = [
                 `URL: ${config.api_url || "Not set"}`,
                 `Global Bank: ${config.global_bank || "Not set"}`,
-                `Project Bank (Recall & Default Retain): ${getProjectBank()}`,
+                `Project Bank (Recall & Default Retain): ${getProjectBank(config)}`,
                 `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
-                `Commands: /hindsight status | stats | mission [text]`,
+                `Commands: /hindsight status | stats | settings | doctor`,
             ].join("\n");
             ctx.ui.notify(status, "info");
         },
