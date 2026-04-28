@@ -49,6 +49,7 @@ function getConfig() {
             : ["observation"];
         const recall_budget = merged.recall_budget || "mid";
         const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
+        const recall_timeout = merged.recall_timeout ? parseInt(merged.recall_timeout, 10) : undefined;
         const async_retain = merged.async_retain === "false" ? false : true;
         const retain_feedback = merged.retain_feedback || "status";
         const recall_enabled = merged.recall_enabled === "false" ? false : true;
@@ -62,6 +63,7 @@ function getConfig() {
             recall_types,
             recall_budget,
             recall_max_tokens,
+            recall_timeout,
             async_retain,
             retain_feedback,
             recall_enabled,
@@ -281,6 +283,108 @@ const OPERATIONAL_TOOLS = [
     "bash", "nu", "process", "read", "write", "edit",
     "grep", "ast_grep_search", "ast_grep_replace", "lsp_navigation"
 ];
+const GLOBAL_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const PROJECT_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+const GLOBAL_RETAIN_MISSION = "Focus on user preferences, communication style, workflow habits, and recurring patterns across projects. Deprioritize one-time events and project-specific implementation details.";
+const GLOBAL_OBSERVATIONS_MISSION = "Observations are durable user preferences, coding conventions, tooling decisions, and workflow patterns. Focus on what the user consistently does or prefers — not one-time events or actions. Merge repeated patterns into single observations. Highlight when behavior contradicts previous observations.";
+const PROJECT_RETAIN_MISSION = "Focus on coding conventions, architecture decisions, tech stack choices, project-specific patterns, and user preferences within this codebase. Deprioritize one-time events and transient debugging steps.";
+const PROJECT_OBSERVATIONS_MISSION = "Observations are durable user preferences, coding conventions, tooling decisions, and workflow patterns. Also capture key project context: architecture decisions, tech stack choices, known constraints, and established patterns in the codebase. Focus on what persists across sessions — not one-time events or actions. Merge repeated patterns into single observations. Highlight when behavior contradicts previous observations.";
+function getMissionCachePath() {
+    return join(homedir(), ".hindsight", "mission-cache.json");
+}
+function loadMissionCache() {
+    try {
+        const path = getMissionCachePath();
+        if (!existsSync(path)) {
+            return { global: {}, project: {} };
+        }
+        const data = readFileSync(path, "utf-8");
+        return JSON.parse(data);
+    }
+    catch (_) {
+        return { global: {}, project: {} };
+    }
+}
+function saveMissionCache(cache) {
+    try {
+        const path = getMissionCachePath();
+        mkdirSync(join(homedir(), ".hindsight"), { recursive: true });
+        writeFileSync(path, JSON.stringify(cache, null, 2));
+    }
+    catch (_) { }
+}
+function isCacheStale(timestamp, isGlobal) {
+    if (!timestamp)
+        return true;
+    const ttl = isGlobal ? GLOBAL_TTL_SECONDS : PROJECT_TTL_SECONDS;
+    return Date.now() / 1000 - timestamp > ttl;
+}
+async function setupBankMission(config, bank, isGlobal) {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        const getRes = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+            headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+            signal: controller.signal
+        });
+        clearTimeout(timeout);
+        if (!getRes.ok)
+            return;
+        const getData = await getRes.json();
+        const cfg = getData.config || {};
+        if (cfg.retain_mission != null && cfg.observations_mission != null)
+            return;
+        const retainMission = isGlobal ? GLOBAL_RETAIN_MISSION : PROJECT_RETAIN_MISSION;
+        const observationsMission = isGlobal ? GLOBAL_OBSERVATIONS_MISSION : PROJECT_OBSERVATIONS_MISSION;
+        const updates = {};
+        if (cfg.retain_mission == null)
+            updates.retain_mission = retainMission;
+        if (cfg.observations_mission == null)
+            updates.observations_mission = observationsMission;
+        if (Object.keys(updates).length === 0)
+            return;
+        const patchController = new AbortController();
+        const patchTimeout = setTimeout(() => patchController.abort(), 10000);
+        const patchRes = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+            method: "PATCH",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${config.api_key || ""}`
+            },
+            body: JSON.stringify({ updates }),
+            signal: patchController.signal
+        });
+        clearTimeout(patchTimeout);
+        if (patchRes.ok) {
+            const cache = loadMissionCache();
+            const cacheKey = isGlobal ? "global" : "project";
+            if (!cache[cacheKey])
+                cache[cacheKey] = {};
+            cache[cacheKey][bank] = Math.floor(Date.now() / 1000);
+            saveMissionCache(cache);
+            log(`setupBankMission: ${bank} updated (global=${isGlobal})`);
+        }
+    }
+    catch (_) { }
+}
+async function runMissionAutoSetup(config) {
+    const cache = loadMissionCache();
+    const banksToCheck = [];
+    if (config.global_bank) {
+        banksToCheck.push({ bank: config.global_bank, isGlobal: true });
+    }
+    const projectBank = getProjectBank(config);
+    if (projectBank) {
+        banksToCheck.push({ bank: projectBank, isGlobal: false });
+    }
+    for (const { bank, isGlobal } of banksToCheck) {
+        const cacheKey = isGlobal ? "global" : "project";
+        const entry = cache[cacheKey]?.[bank];
+        if (!isCacheStale(entry, isGlobal))
+            continue;
+        await setupBankMission(config, bank, isGlobal);
+    }
+}
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -302,11 +406,11 @@ export default function hindsightExtension(pi) {
         sessionCwd = ctx.cwd || process.cwd();
         recallDone = false;
         recallAttempts = 0;
-        retainSuccessCount = 0;
-        retainEligibleCount = 0;
         hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
         hookStats.recall = {};
         hookStats.retain = {};
+        retainSuccessCount = 0;
+        retainEligibleCount = 0;
         ctx.ui.setStatus("hindsight", undefined);
         log("session_start: state reset");
         const config = getConfig();
@@ -327,6 +431,15 @@ export default function hindsightExtension(pi) {
                     "Run /hindsight doctor to auto-migrate, or update manually.", "warning");
                 log(`session_start: legacy keys detected: ${keys}`);
             }
+            // Fire-and-forget warm-up ping to wake server before before_agent_start
+            if (config.api_url) {
+                fetch(`${config.api_url}/health`, {
+                    headers: { "Authorization": `Bearer ${config.api_key || ""}` }
+                }).then(() => log("session_start: warm-up ping ok"))
+                    .catch(() => log("session_start: warm-up ping failed (server may be cold)"));
+            }
+            // Fire-and-forget mission auto-setup
+            runMissionAutoSetup(config).catch(() => { });
         }
     });
     pi.on("session_compact", async (_event, ctx) => {
@@ -385,18 +498,30 @@ export default function hindsightExtension(pi) {
                     const reqBody = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
                     if (config.recall_max_tokens !== undefined)
                         reqBody.max_tokens = config.recall_max_tokens;
-                    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${config.api_key || ""}`
-                        },
-                        body: JSON.stringify(reqBody)
-                    });
-                    if (!res.ok)
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
+                    try {
+                        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${config.api_key || ""}`
+                            },
+                            body: JSON.stringify(reqBody),
+                            signal: controller.signal
+                        });
+                        if (!res.ok)
+                            return [];
+                        const data = await res.json();
+                        return (data.results || []).map((r) => `[Bank: ${bank}] - ${r.text}`);
+                    }
+                    catch (e) {
+                        log(`hindsight_recall: bank=${bank} error ${e}`);
                         return [];
-                    const data = await res.json();
-                    return (data.results || []).map((r) => `[Bank: ${bank}] - ${r.text}`);
+                    }
+                    finally {
+                        clearTimeout(timeout);
+                    }
                 });
                 const resultsArrays = await Promise.all(recallPromises);
                 const allResults = resultsArrays.flat();
@@ -460,14 +585,18 @@ export default function hindsightExtension(pi) {
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
             const bank = getProjectBank(config);
             try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${config.api_key || ""}`
                     },
-                    body: JSON.stringify({ query })
+                    body: JSON.stringify({ query }),
+                    signal: controller.signal
                 });
+                clearTimeout(timeout);
                 if (res.ok) {
                     const data = await res.json();
                     return { content: [{ type: "text", text: data.synthesis || JSON.stringify(data) }], details: {} };
@@ -513,25 +642,40 @@ export default function hindsightExtension(pi) {
                 const reqBody = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
                 if (config.recall_max_tokens !== undefined)
                     reqBody.max_tokens = config.recall_max_tokens;
-                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${config.api_key || ""}`
-                    },
-                    body: JSON.stringify(reqBody)
-                });
-                if (!res.ok) {
-                    log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
-                    if (res.status === 401 || res.status === 403)
-                        authFailed = true;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => {
+                    controller.abort();
+                    log(`before_agent_start: bank=${bank} timed out`);
+                }, config.recall_timeout ?? 10000);
+                try {
+                    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${config.api_key || ""}`
+                        },
+                        body: JSON.stringify(reqBody),
+                        signal: controller.signal
+                    });
+                    if (!res.ok) {
+                        log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
+                        if (res.status === 401 || res.status === 403)
+                            authFailed = true;
+                        return [];
+                    }
+                    anyBankSucceeded = true;
+                    const data = await res.json();
+                    const results = (data.results || []).map((r) => `[Bank: ${bank}] - ${r.text}`);
+                    log(`before_agent_start: bank=${bank} got ${results.length} results`);
+                    return results;
+                }
+                catch (e) {
+                    log(`before_agent_start: bank=${bank} error ${e}`);
                     return [];
                 }
-                anyBankSucceeded = true;
-                const data = await res.json();
-                const results = (data.results || []).map((r) => `[Bank: ${bank}] - ${r.text}`);
-                log(`before_agent_start: bank=${bank} got ${results.length} results`);
-                return results;
+                finally {
+                    clearTimeout(timeout);
+                }
             });
             const resultsArrays = await Promise.all(recallPromises);
             if (authFailed) {
@@ -693,7 +837,8 @@ export default function hindsightExtension(pi) {
                     result: allFailed ? "failed" : "ok",
                     detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
                 };
-                if (!allFailed) retainSuccessCount++;
+                if (!allFailed)
+                    retainSuccessCount++;
                 const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
                 const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
                 if (allFailed) {
@@ -751,7 +896,8 @@ export default function hindsightExtension(pi) {
                 result: allFailed ? "failed" : "ok",
                 detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
             };
-            if (!allFailed) retainSuccessCount++;
+            if (!allFailed)
+                retainSuccessCount++;
             const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
             const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
             if (allFailed) {

@@ -325,6 +325,121 @@ const OPERATIONAL_TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Mission Auto-Setup Cache
+// ---------------------------------------------------------------------------
+
+interface MissionCache {
+  global: Record<string, number>;
+  project: Record<string, number>;
+}
+
+export const GLOBAL_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const PROJECT_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+
+export const GLOBAL_RETAIN_MISSION = "Focus on user preferences, communication style, workflow habits, and recurring patterns across projects. Deprioritize one-time events and project-specific implementation details.";
+export const GLOBAL_OBSERVATIONS_MISSION = "Observations are durable user preferences, coding conventions, tooling decisions, and workflow patterns. Focus on what the user consistently does or prefers — not one-time events or actions. Merge repeated patterns into single observations. Highlight when behavior contradicts previous observations.";
+
+export const PROJECT_RETAIN_MISSION = "Focus on coding conventions, architecture decisions, tech stack choices, project-specific patterns, and user preferences within this codebase. Deprioritize one-time events and transient debugging steps.";
+export const PROJECT_OBSERVATIONS_MISSION = "Observations are durable user preferences, coding conventions, tooling decisions, and workflow patterns. Also capture key project context: architecture decisions, tech stack choices, known constraints, and established patterns in the codebase. Focus on what persists across sessions — not one-time events or actions. Merge repeated patterns into single observations. Highlight when behavior contradicts previous observations.";
+
+export function getMissionCachePath(): string {
+  return join(homedir(), ".hindsight", "mission-cache.json");
+}
+
+export function loadMissionCache(): MissionCache {
+  try {
+    const path = getMissionCachePath();
+    if (!existsSync(path)) {
+      return { global: {}, project: {} };
+    }
+    const data = readFileSync(path, "utf-8");
+    return JSON.parse(data);
+  } catch (_) {
+    return { global: {}, project: {} };
+  }
+}
+
+export function saveMissionCache(cache: MissionCache): void {
+  try {
+    const path = getMissionCachePath();
+    mkdirSync(join(homedir(), ".hindsight"), { recursive: true });
+    writeFileSync(path, JSON.stringify(cache, null, 2));
+  } catch (_) {}
+}
+
+export function isCacheStale(timestamp: number, isGlobal: boolean): boolean {
+  if (!timestamp) return true;
+  const ttl = isGlobal ? GLOBAL_TTL_SECONDS : PROJECT_TTL_SECONDS;
+  return Date.now() / 1000 - timestamp > ttl;
+}
+
+export async function setupBankMission(
+  config: HindsightConfig,
+  bank: string,
+  isGlobal: boolean
+): Promise<void> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const getRes = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+      headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!getRes.ok) return;
+    const getData = await getRes.json();
+    const cfg = getData.config || {};
+    if (cfg.retain_mission != null && cfg.observations_mission != null) return;
+
+    const retainMission = isGlobal ? GLOBAL_RETAIN_MISSION : PROJECT_RETAIN_MISSION;
+    const observationsMission = isGlobal ? GLOBAL_OBSERVATIONS_MISSION : PROJECT_OBSERVATIONS_MISSION;
+    const updates: Record<string, string> = {};
+    if (cfg.retain_mission == null) updates.retain_mission = retainMission;
+    if (cfg.observations_mission == null) updates.observations_mission = observationsMission;
+    if (Object.keys(updates).length === 0) return;
+
+    const patchController = new AbortController();
+    const patchTimeout = setTimeout(() => patchController.abort(), 10000);
+    const patchRes = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${config.api_key || ""}`
+      },
+      body: JSON.stringify({ updates }),
+      signal: patchController.signal
+    });
+    clearTimeout(patchTimeout);
+    if (patchRes.ok) {
+      const cache = loadMissionCache();
+      const cacheKey = isGlobal ? "global" : "project";
+      if (!cache[cacheKey]) cache[cacheKey] = {};
+      cache[cacheKey][bank] = Math.floor(Date.now() / 1000);
+      saveMissionCache(cache);
+      log(`setupBankMission: ${bank} updated (global=${isGlobal})`);
+    }
+  } catch (_) {}
+}
+
+export async function runMissionAutoSetup(config: HindsightConfig): Promise<void> {
+  const cache = loadMissionCache();
+  const banksToCheck: { bank: string; isGlobal: boolean }[] = [];
+  if (config.global_bank) {
+    banksToCheck.push({ bank: config.global_bank, isGlobal: true });
+  }
+  const projectBank = getProjectBank(config);
+  if (projectBank) {
+    banksToCheck.push({ bank: projectBank, isGlobal: false });
+  }
+  for (const { bank, isGlobal } of banksToCheck) {
+    const cacheKey = isGlobal ? "global" : "project";
+    const entry = cache[cacheKey]?.[bank];
+    if (!isCacheStale(entry, isGlobal)) continue;
+    await setupBankMission(config, bank, isGlobal);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -386,6 +501,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         }).then(() => log("session_start: warm-up ping ok"))
           .catch(() => log("session_start: warm-up ping failed (server may be cold)"));
       }
+
+      // Fire-and-forget mission auto-setup
+      runMissionAutoSetup(config).catch(() => {});
     }
   });
 

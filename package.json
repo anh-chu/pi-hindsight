@@ -1,6 +1,6 @@
 {
   "name": "pi-hindsight",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Hindsight self-hosted memory extension for Pi",
   "type": "module",
   "main": "index.js",
@@ -31,6 +31,7 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types test.ts",
+    "test:mission": "vitest run __tests__/mission-setup.test.ts",
     "build": "tsc index.ts",
     "check": "npm run build"
   },
@@ -48,13 +49,15 @@
     "@mariozechner/pi-tui": "*"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.66.1",
+    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "^0.34.49"
   },
   "devDependencies": {
+    "@marcfargas/pi-test-harness": "^0.5.0",
     "@types/node": "^25.6.0",
-    "typescript": "^6.0.2"
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.5"
   }
 }
