@@ -39,6 +39,7 @@ interface HindsightConfig {
   recall_types?: string[];
   recall_budget?: string;
   recall_max_tokens?: number;
+  recall_timeout?: number;
   async_retain?: boolean;
   retain_feedback?: "message" | "status" | "both" | "none";
   recall_enabled?: boolean;
@@ -74,6 +75,7 @@ function getConfig(): HindsightConfig | null {
       : ["observation"];
     const recall_budget = merged.recall_budget || "mid";
     const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
+    const recall_timeout = merged.recall_timeout ? parseInt(merged.recall_timeout, 10) : undefined;
     const async_retain = merged.async_retain === "false" ? false : true;
     const retain_feedback: "message" | "status" | "both" | "none" = (merged.retain_feedback as any) || "status";
     const recall_enabled = merged.recall_enabled === "false" ? false : true;
@@ -87,6 +89,7 @@ function getConfig(): HindsightConfig | null {
       recall_types,
       recall_budget,
       recall_max_tokens,
+      recall_timeout,
       async_retain,
       retain_feedback,
       recall_enabled,
@@ -375,6 +378,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         );
         log(`session_start: legacy keys detected: ${keys}`);
       }
+
+      // Fire-and-forget warm-up ping to wake server before before_agent_start
+      if (config.api_url) {
+        fetch(`${config.api_url}/health`, {
+          headers: { "Authorization": `Bearer ${config.api_key || ""}` }
+        }).then(() => log("session_start: warm-up ping ok"))
+          .catch(() => log("session_start: warm-up ping failed (server may be cold)"));
+      }
     }
   });
 
@@ -438,17 +449,27 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         const recallPromises = banks.map(async (bank) => {
           const reqBody: Record<string, any> = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
           if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
-          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${config.api_key || ""}`
-            },
-            body: JSON.stringify(reqBody)
-          });
-          if (!res.ok) return [];
-          const data = await res.json();
-          return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
+          try {
+            const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${config.api_key || ""}`
+              },
+              body: JSON.stringify(reqBody),
+              signal: controller.signal
+            });
+            if (!res.ok) return [];
+            const data = await res.json();
+            return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+          } catch (e: any) {
+            log(`hindsight_recall: bank=${bank} error ${e}`);
+            return [];
+          } finally {
+            clearTimeout(timeout);
+          }
         });
 
         const resultsArrays = await Promise.all(recallPromises);
@@ -511,14 +532,18 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
       const bank = getProjectBank(config);
       try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${config.api_key || ""}`
           },
-          body: JSON.stringify({ query })
+          body: JSON.stringify({ query }),
+          signal: controller.signal
         });
+        clearTimeout(timeout);
         if (res.ok) {
           const data = await res.json();
           return { content: [{ type: "text" as const, text: data.synthesis || JSON.stringify(data) }], details: {} };
@@ -568,25 +593,38 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const recallPromises = banks.map(async (bank) => {
         const reqBody: Record<string, any> = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
         if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify(reqBody)
-        });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => {
+          controller.abort();
+          log(`before_agent_start: bank=${bank} timed out`);
+        }, config.recall_timeout ?? 10000);
+        try {
+          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${config.api_key || ""}`
+            },
+            body: JSON.stringify(reqBody),
+            signal: controller.signal
+          });
 
-        if (!res.ok) {
-          log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
-          if (res.status === 401 || res.status === 403) authFailed = true;
+          if (!res.ok) {
+            log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
+            if (res.status === 401 || res.status === 403) authFailed = true;
+            return [];
+          }
+          anyBankSucceeded = true;
+          const data = await res.json();
+          const results = (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+          log(`before_agent_start: bank=${bank} got ${results.length} results`);
+          return results;
+        } catch (e: any) {
+          log(`before_agent_start: bank=${bank} error ${e}`);
           return [];
+        } finally {
+          clearTimeout(timeout);
         }
-        anyBankSucceeded = true;
-        const data = await res.json();
-        const results = (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
-        log(`before_agent_start: bank=${bank} got ${results.length} results`);
-        return results;
       });
 
       const resultsArrays = await Promise.all(recallPromises);

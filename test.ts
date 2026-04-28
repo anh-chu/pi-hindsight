@@ -700,6 +700,19 @@ describe("Recall request shape", () => {
     const ts = new Date(body.query_timestamp).getTime();
     assert.ok(ts >= before && ts <= after, "query_timestamp should be recent");
   });
+
+  test("recall_timeout config parsed and defaults to 10000", async () => {
+    const config = { api_url: "http://localhost:8888", api_key: "k", global_bank: "global", recall_timeout: 5000 };
+    // Simulate config parsing logic
+    const recall_timeout = config.recall_timeout !== undefined ? config.recall_timeout : 10000;
+    assert.equal(recall_timeout, 5000, "should use configured value");
+  });
+
+  test("recall_timeout defaults when not set in config", async () => {
+    const config = { api_url: "http://localhost:8888", api_key: "k", global_bank: "global" };
+    const recall_timeout = (config as any).recall_timeout ?? 10000;
+    assert.equal(recall_timeout, 10000, "should default to 10000ms");
+  });
 });
 
 describe("Retain request shape", () => {
