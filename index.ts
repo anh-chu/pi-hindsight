@@ -40,6 +40,7 @@ interface HindsightConfig {
   recall_budget?: string;
   recall_max_tokens?: number;
   async_retain?: boolean;
+  retain_feedback?: "message" | "status" | "both" | "none";
   recall_enabled?: boolean;
   retain_enabled?: boolean;
   homedir_project?: boolean;
@@ -74,6 +75,7 @@ function getConfig(): HindsightConfig | null {
     const recall_budget = merged.recall_budget || "mid";
     const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
     const async_retain = merged.async_retain === "false" ? false : true;
+    const retain_feedback: "message" | "status" | "both" | "none" = (merged.retain_feedback as any) || "status";
     const recall_enabled = merged.recall_enabled === "false" ? false : true;
     const retain_enabled = merged.retain_enabled === "false" ? false : true;
     const homedir_project = merged.homedir_project === "false" ? false : true;
@@ -86,6 +88,7 @@ function getConfig(): HindsightConfig | null {
       recall_budget,
       recall_max_tokens,
       async_retain,
+      retain_feedback,
       recall_enabled,
       retain_enabled,
       homedir_project,
@@ -327,6 +330,8 @@ const MAX_RECALL_ATTEMPTS = 3;
 export default function hindsightExtension(pi: ExtensionAPI) {
   let recallDone = false;
   let recallAttempts = 0;
+  let retainSuccessCount = 0;
+  let retainEligibleCount = 0;
   let currentPrompt = "";
 
   // Track user input for fallback
@@ -342,6 +347,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
     hookStats.recall = {};
     hookStats.retain = {};
+    retainSuccessCount = 0;
+    retainEligibleCount = 0;
     ctx.ui.setStatus("hindsight", undefined);
     log("session_start: state reset");
     const config = getConfig();
@@ -375,6 +382,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     sessionCwd = ctx.cwd || process.cwd();
     recallDone = false;
     recallAttempts = 0;
+    retainSuccessCount = 0;
+    retainEligibleCount = 0;
     ctx.ui.setStatus("hindsight", undefined);
     log("session_compact: state reset");
   });
@@ -710,6 +719,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     const banks = getRetainBanks(config, lastUserPrompt);
 
+    // Count this attempt (before the retain APIs)
+    retainEligibleCount++;
+
     // Async retain: fire and forget, don't block
     if (config.async_retain !== false) {
       log("agent_end: async retain fired (not awaiting)");
@@ -748,18 +760,29 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           result: allFailed ? "failed" : "ok",
           detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
         };
+        if (!allFailed) retainSuccessCount++;
+        const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
+        const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
         if (allFailed) {
           log("agent_end: async retain - all banks failed");
           pi.sendMessage(
             { customType: "hindsight-retain-failed", content: "", display: true },
             { deliverAs: "nextTurn" }
           );
+          if (showStatus) {
+            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+          }
         } else {
           log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-          pi.sendMessage(
-            { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
-            { deliverAs: "nextTurn" }
-          );
+          if (showStatus) {
+            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+          }
+          if (showMessage) {
+            pi.sendMessage(
+              { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
+              { deliverAs: "nextTurn" }
+            );
+          }
         }
       });
       return;
@@ -804,9 +827,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         result: allFailed ? "failed" : "ok",
         detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
       };
+      if (!allFailed) retainSuccessCount++;
+      const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
+      const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
       if (allFailed) {
         log("agent_end: all banks failed - sending next-turn notification");
-        ctx.ui.setStatus("hindsight", "⚠ retain failed");
+        if (showStatus) {
+          ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+        }
         pi.sendMessage(
           {
             customType: "hindsight-retain-failed",
@@ -816,16 +844,22 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           { deliverAs: "nextTurn" }
         );
       } else {
-        ctx.ui.setStatus("hindsight", undefined);
-        pi.sendMessage(
-          {
-            customType: "hindsight-retain",
-            content: "",
-            display: true,
-            details: { banks: succeededBanks },
-          },
-          { deliverAs: "nextTurn" }
-        );
+        if (showStatus) {
+          ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+        } else {
+          ctx.ui.setStatus("hindsight", undefined);
+        }
+        if (showMessage) {
+          pi.sendMessage(
+            {
+              customType: "hindsight-retain",
+              content: "",
+              display: true,
+              details: { banks: succeededBanks },
+            },
+            { deliverAs: "nextTurn" }
+          );
+        }
       }
     } catch (e) {
       log(`agent_end: error ${e}`);
@@ -929,6 +963,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           { key: "recall_enabled", label: "Auto-Recall", isBool: true, default: "true" },
           { key: "retain_enabled", label: "Auto-Retain", isBool: true, default: "true" },
           { key: "async_retain", label: "Async Retain", isBool: true, default: "true" },
+          { key: "retain_feedback", label: "Retain Feedback", isBool: false, default: "status" },
           { key: "homedir_project", label: "Home Dir as Project", isBool: true, default: "true" },
           { key: "recall_types", label: "Recall Types", isBool: false, default: "observation" },
           { key: "recall_budget", label: "Recall Budget", isBool: false, default: "mid" },
