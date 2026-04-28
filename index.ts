@@ -16,6 +16,7 @@ import { Type } from "@sinclair/typebox";
 
 const DEBUG = process.env.HINDSIGHT_DEBUG === "1";
 const LOG_PATH = join(homedir(), ".hindsight", "debug.log");
+let sessionCwd: string = process.cwd();
 
 function log(msg: string) {
   if (!DEBUG) return;
@@ -61,7 +62,7 @@ function getConfig(): HindsightConfig | null {
     const global = parseConfigFile(globalCfgPath);
 
     // Project-level override: .hindsight/config in CWD
-    const localCfgPath = join(process.cwd(), ".hindsight", "config");
+    const localCfgPath = join(sessionCwd, ".hindsight", "config");
     const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
 
     const merged = applyAliases({ ...global, ...local });
@@ -131,8 +132,8 @@ function applyAliases(raw: Record<string, string>): Record<string, string> {
 function detectLegacyKeys(): { file: string; key: string; canonical: string }[] {
   const issues: { file: string; key: string; canonical: string }[] = [];
   const globalCfgPath = join(homedir(), ".hindsight", "config");
-  const localCfgPath = join(process.cwd(), ".hindsight", "config");
-  const isHomeDir = process.cwd() === homedir();
+  const localCfgPath = join(sessionCwd, ".hindsight", "config");
+  const isHomeDir = sessionCwd === homedir();
   const files = [globalCfgPath];
   if (!isHomeDir && existsSync(localCfgPath)) files.push(localCfgPath);
   for (const file of files) {
@@ -171,8 +172,8 @@ function migrateConfigFile(filePath: string): string[] {
 
 function getConfigWithSource(): { global: Record<string, string>; local: Record<string, string>; merged: Record<string, string>; isHomeDir: boolean } {
   const globalCfgPath = join(homedir(), ".hindsight", "config");
-  const localCfgPath = join(process.cwd(), ".hindsight", "config");
-  const isHomeDir = process.cwd() === homedir();
+  const localCfgPath = join(sessionCwd, ".hindsight", "config");
+  const isHomeDir = sessionCwd === homedir();
   const globalRaw = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
   const localRaw = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
   const global = applyAliases(globalRaw);
@@ -182,11 +183,11 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
 
 function getProjectBank(config?: HindsightConfig | null): string {
   if (config?.project_bank_id) return config.project_bank_id;
-  return `project-${basename(process.cwd())}`;
+  return `project-${basename(sessionCwd)}`;
 }
 
 function isHomeDirSession(): boolean {
-  return process.cwd() === homedir();
+  return sessionCwd === homedir();
 }
 
 function getRecallBanks(config: HindsightConfig): string[] {
@@ -335,6 +336,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionCwd = ctx.cwd || process.cwd();
     recallDone = false;
     recallAttempts = 0;
     hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
@@ -370,6 +372,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (_event, ctx) => {
+    sessionCwd = ctx.cwd || process.cwd();
     recallDone = false;
     recallAttempts = 0;
     ctx.ui.setStatus("hindsight", undefined);
@@ -914,7 +917,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
       if (argsStr === "settings") {
         const globalCfgPath = join(homedir(), ".hindsight", "config");
-        const localCfgPath = join(process.cwd(), ".hindsight", "config");
+        const localCfgPath = join(sessionCwd, ".hindsight", "config");
         let cfg = getConfigWithSource();
         const isHomeDir = cfg.isHomeDir;
 
