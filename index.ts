@@ -444,6 +444,41 @@ export async function runMissionAutoSetup(config: HindsightConfig): Promise<void
 // ---------------------------------------------------------------------------
 
 const MAX_RECALL_ATTEMPTS = 3;
+const RATE_LIMIT_RETRIES = 3;
+const RATE_LIMIT_BACKOFF_MS = [10000, 20000, 40000];
+
+function isRateLimitError(status: number, body: string): boolean {
+  return status === 429 || body.includes("429") || body.includes("TooManyRequestsError");
+}
+
+async function fetchWithRateLimitRetry(
+  url: string,
+  options: RequestInit,
+  label: string,
+): Promise<{ res: Response; rateLimitExhausted: boolean }> {
+  for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
+    const res = await fetch(url, options);
+    if (res.ok) return { res, rateLimitExhausted: false };
+
+    const errorBody = await res.text();
+    if (!isRateLimitError(res.status, errorBody)) {
+      // Non-rate-limit error — return immediately, caller handles it
+      log(`${label}: HTTP ${res.status} - ${errorBody.slice(0, 200)}`);
+      return { res, rateLimitExhausted: false };
+    }
+
+    if (attempt < RATE_LIMIT_RETRIES) {
+      const delay = RATE_LIMIT_BACKOFF_MS[attempt];
+      log(`${label}: rate-limited (429), retrying in ${delay}ms (attempt ${attempt + 1}/${RATE_LIMIT_RETRIES})`);
+      await new Promise((r) => setTimeout(r, delay));
+    } else {
+      log(`${label}: rate-limited (429), exhausted ${RATE_LIMIT_RETRIES} retries`);
+      return { res, rateLimitExhausted: true };
+    }
+  }
+  // unreachable, but satisfy TS
+  throw new Error("unreachable");
+}
 
 export default function hindsightExtension(pi: ExtensionAPI) {
   let recallDone = false;
@@ -570,15 +605,20 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
           try {
-            const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${config.api_key || ""}`
+            const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(
+              `${config.api_url}/v1/default/banks/${bank}/memories/recall`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${config.api_key || ""}`
+                },
+                body: JSON.stringify(reqBody),
+                signal: controller.signal
               },
-              body: JSON.stringify(reqBody),
-              signal: controller.signal
-            });
+              `hindsight_recall: bank=${bank}`,
+            );
+            if (rateLimitExhausted) return { __rateLimited: true };
             if (!res.ok) return [];
             const data = await res.json();
             return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
@@ -591,6 +631,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         });
 
         const resultsArrays = await Promise.all(recallPromises);
+        if (resultsArrays.some((r: any) => r?.__rateLimited)) {
+          return { content: [{ type: "text" as const, text: "Recall rate-limited — reranker quota exceeded (Cohere Trial key: 10 calls/min). Upgrade at https://dashboard.cohere.com/api-keys or switch reranker provider on the Hindsight server." }], details: {}, isError: true };
+        }
         const allResults = resultsArrays.flat();
         if (allResults.length > 0) {
           return { content: [{ type: "text" as const, text: allResults.join("\n\n") }], details: {} };
@@ -708,6 +751,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     try {
       let anyBankSucceeded = false;
       let authFailed = false;
+      let rateLimitedFailed = false;
       const recallPromises = banks.map(async (bank) => {
         const reqBody: Record<string, any> = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
         if (config.recall_max_tokens !== undefined) reqBody.max_tokens = config.recall_max_tokens;
@@ -717,18 +761,25 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           log(`before_agent_start: bank=${bank} timed out`);
         }, config.recall_timeout ?? 10000);
         try {
-          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${config.api_key || ""}`
+          const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(
+            `${config.api_url}/v1/default/banks/${bank}/memories/recall`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${config.api_key || ""}`
+              },
+              body: JSON.stringify(reqBody),
+              signal: controller.signal
             },
-            body: JSON.stringify(reqBody),
-            signal: controller.signal
-          });
+            `before_agent_start: bank=${bank}`,
+          );
 
+          if (rateLimitExhausted) {
+            rateLimitedFailed = true;
+            return [];
+          }
           if (!res.ok) {
-            log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
             if (res.status === 401 || res.status === 403) authFailed = true;
             return [];
           }
@@ -752,6 +803,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
         ctx.ui.setStatus("hindsight", "✗ auth error - check api_key");
         log("before_agent_start: auth error, giving up");
+        return;
+      }
+
+      if (rateLimitedFailed) {
+        hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "rate limited" };
+        recallAttempts = MAX_RECALL_ATTEMPTS;
+        ctx.ui.setStatus("hindsight", "✗ rate-limited (reranker quota exceeded)");
+        log("before_agent_start: rate-limited, giving up");
         return;
       }
 
