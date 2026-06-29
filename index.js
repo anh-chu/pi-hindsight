@@ -389,7 +389,14 @@ async function runMissionAutoSetup(config) {
 // Extension
 // ---------------------------------------------------------------------------
 const MAX_RECALL_ATTEMPTS = 3;
+export function isSubagentChildProcess(env = process.env) {
+    return env.PI_SUBAGENT_CHILD === "1";
+}
 export default function hindsightExtension(pi) {
+    if (isSubagentChildProcess()) {
+        log("disabled inside pi-subagents child process");
+        return;
+    }
     let recallDone = false;
     let recallAttempts = 0;
     let retainSuccessCount = 0;
