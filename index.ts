@@ -480,7 +480,15 @@ async function fetchWithRateLimitRetry(
   throw new Error("unreachable");
 }
 
+export function isSubagentChildProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PI_SUBAGENT_CHILD === "1";
+}
+
 export default function hindsightExtension(pi: ExtensionAPI) {
+  if (isSubagentChildProcess()) {
+    log("disabled inside pi-subagents child process");
+    return;
+  }
   let recallDone = false;
   let recallAttempts = 0;
   let retainSuccessCount = 0;
