@@ -458,7 +458,14 @@ async function fetchWithRateLimitRetry(url, options, label) {
     // unreachable, but satisfy TS
     throw new Error("unreachable");
 }
+export function isSubagentChildProcess(env = process.env) {
+    return env.PI_SUBAGENT_CHILD === "1";
+}
 export default function hindsightExtension(pi) {
+    if (isSubagentChildProcess()) {
+        log("extension disabled in PI_SUBAGENT_CHILD session");
+        return;
+    }
     let recallDone = false;
     let recallAttempts = 0;
     let retainSuccessCount = 0;
@@ -913,35 +920,42 @@ export default function hindsightExtension(pi) {
                 return bank;
             }));
             retainPromise.then((results) => {
-                const succeededBanks = results
-                    .filter(r => r.status === "fulfilled")
-                    .map(r => r.value);
-                const allFailed = succeededBanks.length === 0;
-                hookStats.retain = {
-                    firedAt: new Date().toISOString(),
-                    result: allFailed ? "failed" : "ok",
-                    detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
-                };
-                if (!allFailed)
-                    retainSuccessCount++;
-                const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-                const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
-                if (allFailed) {
-                    log("agent_end: async retain - all banks failed");
-                    pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
-                    if (showStatus) {
-                        ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                try {
+                    const succeededBanks = results
+                        .filter(r => r.status === "fulfilled")
+                        .map(r => r.value);
+                    const allFailed = succeededBanks.length === 0;
+                    hookStats.retain = {
+                        firedAt: new Date().toISOString(),
+                        result: allFailed ? "failed" : "ok",
+                        detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+                    };
+                    if (!allFailed)
+                        retainSuccessCount++;
+                    const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
+                    const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
+                    if (allFailed) {
+                        log("agent_end: async retain - all banks failed");
+                        pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+                        if (showStatus) {
+                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                        }
+                    }
+                    else {
+                        log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
+                        if (showStatus) {
+                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                        }
+                        if (showMessage) {
+                            pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
+                        }
                     }
                 }
-                else {
-                    log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-                    if (showStatus) {
-                        ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-                    }
-                    if (showMessage) {
-                        pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
-                    }
+                catch (error) {
+                    log(`agent_end: async retain feedback skipped: ${String(error)}`);
                 }
+            }).catch((error) => {
+                log(`agent_end: async retain failed: ${String(error)}`);
             });
             return;
         }
