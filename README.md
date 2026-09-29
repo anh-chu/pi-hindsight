@@ -139,6 +139,19 @@ recall_max_tokens = 512
 | `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. |
 | `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, this bank is queried alongside the project bank on every recall. Turns tagged `#global` or `#me` are also retained here. Leave unset if you only want per-project memory. |
 
+### Environment variable overrides
+
+Banks can also be steered from the environment, using the same variables omp reads (env beats config). This lets launchers and wrappers pick a memory bank per agent without writing config files.
+
+| Variable | Effect |
+|----------|--------|
+| `HINDSIGHT_BANK_ID` | Replaces the project bank — the primary bank for both recall and retain. Also overrides any `project_bank_id` config key. |
+| `HINDSIGHT_SCOPING=global` | Additionally replaces `global_bank` with `HINDSIGHT_BANK_ID`, collapsing recall + retain into one flat bank per agent (same semantics as omp's `global` scoping). |
+| `HINDSIGHT_SCOPING=per-project` / `per-project-tagged` | Overrides the project bank only; the configured `global_bank` stays in the recall mix. pi-hindsight has no tag-scoped scoping, so omp's per-project-tagged behavior (same bank with project tags) is approximated, not replicated. |
+| `HINDSIGHT_RETAIN_EVERY_N_TURNS` | Ignored — omp-only. Retention runs at `agent_end` on every turn. |
+
+Precedence: environment > project config > global config > `project-<dirname>` default. Without `HINDSIGHT_BANK_ID` the environment has no effect. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
+
 ## Commands
 
 ### `/hindsight status`
