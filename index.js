@@ -5,7 +5,8 @@
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
+import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 // ---------------------------------------------------------------------------
 // Debug Logging
@@ -33,6 +34,31 @@ function parseConfigFile(filePath) {
     }
     return config;
 }
+/**
+ * API key from the OS keyring, for processes not started from a login shell (e.g. desktop
+ * apps that never see ~/.zshrc). macOS: Keychain item service "hindsight", account = OS
+ * user. Linux: libsecret item `service=hindsight` (store with `secret-tool store --label
+ * Hindsight service hindsight`). Cached per process; empty when absent.
+ */
+let keychainApiKey;
+function readKeychainApiKey() {
+    if (keychainApiKey !== undefined)
+        return keychainApiKey || undefined;
+    const command = process.platform === "darwin"
+        ? ["security", ["find-generic-password", "-s", "hindsight", "-a", userInfo().username, "-w"]]
+        : process.platform === "linux"
+            ? ["secret-tool", ["lookup", "service", "hindsight"]]
+            : undefined;
+    try {
+        keychainApiKey = command
+            ? execFileSync(command[0], command[1], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim()
+            : "";
+    }
+    catch {
+        keychainApiKey = "";
+    }
+    return keychainApiKey || undefined;
+}
 function getConfig() {
     try {
         const globalCfgPath = join(homedir(), ".hindsight", "config");
@@ -58,7 +84,7 @@ function getConfig() {
         const homedir_project = merged.homedir_project === "false" ? false : true;
         return {
             api_url: merged.api_url,
-            api_key: merged.api_key,
+            api_key: merged.api_key || process.env.HINDSIGHT_API_KEY || readKeychainApiKey(),
             global_bank: merged.global_bank,
             project_bank_id: merged.project_bank_id,
             recall_types,
