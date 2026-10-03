@@ -37,7 +37,8 @@ function parseConfigFile(filePath) {
 /**
  * API key from the OS keyring, for processes not started from a login shell (e.g. desktop
  * apps that never see ~/.zshrc). macOS: Keychain item service "hindsight", account = OS
- * user. Linux: libsecret item `service=hindsight` (store with `secret-tool store --label
+ * user, read from the login keychain by path (SSH sessions don't search it by default).
+ * Linux: libsecret item `service=hindsight` (store with `secret-tool store --label
  * Hindsight service hindsight`). Cached per process; empty when absent.
  */
 let keychainApiKey;
@@ -45,7 +46,7 @@ function readKeychainApiKey() {
     if (keychainApiKey !== undefined)
         return keychainApiKey || undefined;
     const command = process.platform === "darwin"
-        ? ["security", ["find-generic-password", "-s", "hindsight", "-a", userInfo().username, "-w"]]
+        ? ["security", ["find-generic-password", "-s", "hindsight", "-a", userInfo().username, "-w", join(homedir(), "Library", "Keychains", "login.keychain-db")]]
         : process.platform === "linux"
             ? ["secret-tool", ["lookup", "service", "hindsight"]]
             : undefined;
