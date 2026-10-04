@@ -1008,6 +1008,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     }
 
     const banks = getRetainBanks(config, lastUserPrompt);
+    // Home-dir session with homedir_project=false and no #global/#me: nothing to retain.
+    // Returning here keeps an empty bank list from being reported as a failed retain.
+    if (banks.length === 0) {
+      log("agent_end: no retain banks, skipping");
+      return;
+    }
 
     // Count this attempt (before the retain APIs)
     retainEligibleCount++;

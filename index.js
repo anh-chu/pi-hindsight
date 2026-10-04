@@ -917,6 +917,12 @@ export default function hindsightExtension(pi) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
         const banks = getRetainBanks(config, lastUserPrompt);
+        // Home-dir session with homedir_project=false and no #global/#me: nothing to retain.
+        // Returning here keeps an empty bank list from being reported as a failed retain.
+        if (banks.length === 0) {
+            log("agent_end: no retain banks, skipping");
+            return;
+        }
         // Count this attempt (before the retain APIs)
         retainEligibleCount++;
         // Async retain: fire and forget, don't block
