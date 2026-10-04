@@ -6,7 +6,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { homedir, userInfo } from "node:os";
 import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
@@ -254,9 +254,47 @@ export function applyEnvOverrides(merged: Record<string, string>): void {
   }
 }
 
+/**
+ * Project name for a directory: the main repository's folder name when inside git, so every
+ * worktree (e.g. ~/.t3/worktrees/<repo>/<branch>) and subfolder of a repo shares one bank on
+ * every machine. Outside git, or if git fails, the folder name (the pre-worktree behavior).
+ */
+const projectNameCache = new Map<string, string>();
+export function projectNameForCwd(cwd: string): string {
+  const cached = projectNameCache.get(cwd);
+  if (cached) return cached;
+  let name = basename(cwd);
+  try {
+    const [commonDir, topLevel] = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000 },
+    ).trim().split("\n");
+    // Normal repo or linked worktree: <main checkout>/.git. Bare repo with worktrees:
+    // <name>.git. Submodules and separate git dirs keep their git data elsewhere, so use
+    // their own checkout's folder name.
+    if (commonDir?.endsWith("/.git")) name = basename(dirname(commonDir));
+    else if (commonDir?.endsWith(".git")) name = basename(commonDir, ".git");
+    else if (topLevel) name = basename(topLevel);
+  } catch {}
+  projectNameCache.set(cwd, name);
+  return name;
+}
+
 function getProjectBank(config?: HindsightConfig | null): string {
   if (config?.project_bank_id) return config.project_bank_id;
-  return `project-${basename(sessionCwd)}`;
+  return `project-${projectNameForCwd(sessionCwd)}`;
+}
+
+/**
+ * Bank this folder used before banks followed the repository. Recall still reads it so memories
+ * saved from a subfolder or worktree under its folder name stay reachable; new retains go to
+ * getProjectBank().
+ */
+function getLegacyProjectBank(config?: HindsightConfig | null): string | undefined {
+  if (config?.project_bank_id) return undefined;
+  const legacy = `project-${basename(sessionCwd)}`;
+  return legacy === getProjectBank(config) ? undefined : legacy;
 }
 
 function isHomeDirSession(): boolean {
@@ -269,6 +307,8 @@ function getRecallBanks(config: HindsightConfig): string[] {
   // Skip project bank in homedir when homedir_project is disabled
   if (!(isHomeDirSession() && config.homedir_project === false)) {
     banks.add(getProjectBank(config));
+    const legacy = getLegacyProjectBank(config);
+    if (legacy) banks.add(legacy);
   }
   return Array.from(banks);
 }
