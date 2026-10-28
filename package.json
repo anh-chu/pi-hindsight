@@ -1,6 +1,6 @@
 {
   "name": "pi-hindsight",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Hindsight self-hosted memory extension for Pi",
   "type": "module",
   "main": "index.js",
@@ -19,7 +19,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   },
   "pi": {
     "extensions": [

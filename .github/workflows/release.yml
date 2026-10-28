@@ -1,6 +1,7 @@
 name: release
 
 on:
+  pull_request:
   push:
     branches:
       - main
@@ -9,7 +10,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  node22:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+
   release:
+    needs: node22
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
