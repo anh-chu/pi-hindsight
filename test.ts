@@ -1473,6 +1473,7 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     const merged = env("agent-bank", "per-project");
     assert.equal(merged.project_bank_id, "agent-bank");
     assert.equal(merged.global_bank, "shared-global");
+    assert.equal(merged.homedir_project, "true");
   });
 
   test("unknown scoping values are ignored", () => {
