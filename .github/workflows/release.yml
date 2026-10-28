@@ -64,6 +64,13 @@ jobs:
 
       - name: Publish to npm
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && steps.version_check.outputs.changed == 'true')
-        run: npm publish --access public
+        run: |
+          npm whoami > /dev/null
+          PACKAGE_VERSION=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
+          if npm view "pi-hindsight@$PACKAGE_VERSION" version > /dev/null 2>&1; then
+            echo "pi-hindsight@$PACKAGE_VERSION is already published"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
