@@ -220,7 +220,11 @@ export function applyEnvOverrides(merged: Record<string, string>): void {
   if (!bank) return;
   const scoping = (process.env.HINDSIGHT_SCOPING || "").trim();
   merged.project_bank_id = bank;
-  if (scoping === "global") merged.global_bank = "";
+  if (scoping === "global") {
+    merged.global_bank = "";
+    // An explicitly selected global bank must also work from the home directory.
+    merged.homedir_project = "true";
+  }
 }
 
 function getProjectBank(config?: HindsightConfig | null): string {

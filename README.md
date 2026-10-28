@@ -152,6 +152,8 @@ Banks can also be steered from the environment, using the same variables omp rea
 
 Precedence: environment > project config > global config > `project-<dirname>` default. Without `HINDSIGHT_BANK_ID` the environment has no effect. `HINDSIGHT_DEBUG=1` turns on debug logging (see below).
 
+With `HINDSIGHT_SCOPING=global`, the selected bank is also active in the home directory, even when `homedir_project` is `false`.
+
 ## Commands
 
 ### `/hindsight status`

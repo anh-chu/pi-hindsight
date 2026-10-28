@@ -1456,6 +1456,17 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     const merged = env("agent-bank", "global");
     assert.equal(merged.project_bank_id, "agent-bank");
     assert.equal(merged.global_bank, "");
+    assert.equal(merged.homedir_project, "true");
+  });
+
+  test("global scoping enables the selected bank in the home directory", () => {
+    process.env.HINDSIGHT_BANK_ID = "agent-bank";
+    process.env.HINDSIGHT_SCOPING = "global";
+    const merged = { homedir_project: "false", global_bank: "shared-global" };
+    applyEnvOverrides(merged);
+    assert.equal(merged.homedir_project, "true");
+    assert.equal(merged.global_bank, "");
+    assert.equal((merged as Record<string, string>).project_bank_id, "agent-bank");
   });
 
   test("scoping=per-project keeps the configured global_bank", () => {

@@ -194,8 +194,11 @@ export function applyEnvOverrides(merged) {
         return;
     const scoping = (process.env.HINDSIGHT_SCOPING || "").trim();
     merged.project_bank_id = bank;
-    if (scoping === "global")
+    if (scoping === "global") {
         merged.global_bank = "";
+        // An explicitly selected global bank must also work from the home directory.
+        merged.homedir_project = "true";
+    }
 }
 function getProjectBank(config) {
     if (config?.project_bank_id)
