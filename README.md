@@ -12,7 +12,7 @@ Persistent memory for Pi, backed by a self-hosted [Hindsight](https://github.com
 
 ## Requirements
 
-Node.js 24 or later is required. On Node.js 22, npm reports an `EBADENGINE` warning; upgrade Node.js before installing the extension.
+Node.js 22 or later is required.
 
 This extension connects to a **self-hosted Hindsight server**. It does not include or manage the backend.
 
