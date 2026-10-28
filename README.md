@@ -12,6 +12,8 @@ Persistent memory for Pi, backed by a self-hosted [Hindsight](https://github.com
 
 ## Requirements
 
+Node.js 24 or later is required. On Node.js 22, npm reports an `EBADENGINE` warning; upgrade Node.js before installing the extension.
+
 This extension connects to a **self-hosted Hindsight server**. It does not include or manage the backend.
 
 You need a running [Hindsight](https://github.com/vectorize-io/hindsight) server.
