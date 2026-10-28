@@ -1,6 +1,7 @@
 name: release
 
 on:
+  pull_request:
   push:
     branches:
       - main
@@ -23,6 +24,7 @@ jobs:
 
   release:
     needs: node22
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
