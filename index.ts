@@ -68,6 +68,7 @@ function getConfig(): HindsightConfig | null {
     const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
 
     const merged = applyAliases({ ...global, ...local });
+    applyEnvOverrides(merged);
 
     const recallTypesRaw = merged.recall_types;
     const recall_types = recallTypesRaw
@@ -184,7 +185,46 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
   const localRaw = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
   const global = applyAliases(globalRaw);
   const local = applyAliases(localRaw);
-  return { global, local, merged: { ...global, ...local }, isHomeDir };
+  const merged = { ...global, ...local };
+  applyEnvOverrides(merged); // reflect env overrides in the /hindsight settings view
+  return { global, local, merged, isHomeDir };
+}
+
+// ---------------------------------------------------------------------------
+// Environment variable overrides (omp-compatible bank contract)
+// ---------------------------------------------------------------------------
+// omp reads HINDSIGHT_BANK_ID / HINDSIGHT_SCOPING directly from the environment
+// (env beats config). Honoring the same variables here keeps the two memory
+// implementations interchangeable when a launcher exports them per agent
+// (e.g. agent wrappers that already steer omp this way). Precedence:
+// environment > project config > global config > `project-<dirname>` default.
+//
+//   HINDSIGHT_BANK_ID           Replaces the project bank — the primary bank
+//                               for both recall and retain.
+//   HINDSIGHT_SCOPING=global    Additionally replaces global_bank with the same
+//                               id, collapsing recall + retain into one flat
+//                               bank per agent (omp's "global" scoping).
+//   HINDSIGHT_SCOPING=per-project|per-project-tagged
+//                               Overrides the project bank only; the configured
+//                               global_bank stays in the recall mix. (pi-hindsight
+//                               has no tag-scoped scoping; see README.)
+//   Any other HINDSIGHT_SCOPING value is ignored.
+//
+// HINDSIGHT_RETAIN_EVERY_N_TURNS (omp) has no equivalent here: retain runs at
+// agent_end on every turn, so it is deliberately not read.
+//
+// Without HINDSIGHT_BANK_ID this is a no-op — config-driven setups are
+// unaffected.
+export function applyEnvOverrides(merged: Record<string, string>): void {
+  const bank = process.env.HINDSIGHT_BANK_ID?.trim();
+  if (!bank) return;
+  const scoping = (process.env.HINDSIGHT_SCOPING || "").trim();
+  merged.project_bank_id = bank;
+  // An explicitly selected bank must also work from the home directory.
+  merged.homedir_project = "true";
+  if (scoping === "global") {
+    merged.global_bank = "";
+  }
 }
 
 function getProjectBank(config?: HindsightConfig | null): string {

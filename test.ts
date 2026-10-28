@@ -6,7 +6,7 @@
  * Or after build: node test.js
  */
 
-import { test, describe, beforeEach, mock } from "node:test";
+import { test, describe, beforeEach, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 
 // ---------------------------------------------------------------------------
@@ -1405,5 +1405,86 @@ describe("readRecentLogErrors", () => {
       const result = readRecentLogErrors(logPath, 20);
       assert.equal(result.length, 2);
     } finally { rmSync(dir, { recursive: true }); }
+  });
+});
+
+// ─── environment variable overrides (omp-compatible bank contract) ───────────
+
+// These tests import the real extension, which needs its npm dependencies
+// installed. Skipped on a fresh checkout without node_modules so that
+// `node --experimental-strip-types test.ts` still runs.
+const extensionDepsInstalled = existsSync("node_modules/@sinclair/typebox");
+
+describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  const originalEnv = { ...process.env };
+  let applyEnvOverrides: (merged: Record<string, string>) => void;
+
+  before(async () => {
+    ({ applyEnvOverrides } = await import("./index.ts"));
+  });
+
+  beforeEach(() => {
+    delete process.env.HINDSIGHT_BANK_ID;
+    delete process.env.HINDSIGHT_SCOPING;
+  });
+
+  after(() => {
+    process.env = originalEnv;
+  });
+
+  function env(bank?: string, scoping?: string): Record<string, string> {
+    if (bank !== undefined) process.env.HINDSIGHT_BANK_ID = bank;
+    if (scoping !== undefined) process.env.HINDSIGHT_SCOPING = scoping;
+    const merged: Record<string, string> = { api_url: "http://x", global_bank: "shared-global", recall_budget: "mid" };
+    applyEnvOverrides(merged);
+    return merged;
+  }
+
+  test("is a no-op without HINDSIGHT_BANK_ID", () => {
+    const merged = env();
+    assert.equal(merged.project_bank_id, undefined);
+    assert.equal(merged.global_bank, "shared-global");
+  });
+
+  test("overrides the project bank, keeps configured global_bank when scoping is unset", () => {
+    const merged = env("agent-bank");
+    assert.equal(merged.project_bank_id, "agent-bank");
+    assert.equal(merged.global_bank, "shared-global");
+  });
+
+  test("scoping=global collapses into one flat bank", () => {
+    const merged = env("agent-bank", "global");
+    assert.equal(merged.project_bank_id, "agent-bank");
+    assert.equal(merged.global_bank, "");
+    assert.equal(merged.homedir_project, "true");
+  });
+
+  test("global scoping enables the selected bank in the home directory", () => {
+    process.env.HINDSIGHT_BANK_ID = "agent-bank";
+    process.env.HINDSIGHT_SCOPING = "global";
+    const merged = { homedir_project: "false", global_bank: "shared-global" };
+    applyEnvOverrides(merged);
+    assert.equal(merged.homedir_project, "true");
+    assert.equal(merged.global_bank, "");
+    assert.equal((merged as Record<string, string>).project_bank_id, "agent-bank");
+  });
+
+  test("scoping=per-project keeps the configured global_bank", () => {
+    const merged = env("agent-bank", "per-project");
+    assert.equal(merged.project_bank_id, "agent-bank");
+    assert.equal(merged.global_bank, "shared-global");
+    assert.equal(merged.homedir_project, "true");
+  });
+
+  test("unknown scoping values are ignored", () => {
+    const merged = env("agent-bank", "banana");
+    assert.equal(merged.project_bank_id, "agent-bank");
+    assert.equal(merged.global_bank, "shared-global");
+  });
+
+  test("whitespace around the bank id is trimmed", () => {
+    const merged = env("  agent-bank  ", "global");
+    assert.equal(merged.project_bank_id, "agent-bank");
+    assert.equal(merged.global_bank, "");
   });
 });
