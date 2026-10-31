@@ -122,6 +122,8 @@ async_retain     = true
 
 Place a `.hindsight/config` file in any project directory to override global settings. Local values win.
 
+If the project config sets an `api_url` that differs from the global one, your global, `HINDSIGHT_API_KEY` and keyring keys are not sent to it. Set `api_key` in the project config for that server.
+
 ```toml
 recall_types     = "observation,experience"
 recall_budget    = "low"

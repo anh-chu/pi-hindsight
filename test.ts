@@ -1490,21 +1490,33 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
 });
 
 describe("resolveApiKey", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
-  let resolveApiKey: (merged: Record<string, string>, local: Record<string, string>, env?: NodeJS.ProcessEnv) => string | undefined;
+  let resolveApiKey: (global: Record<string, string>, local: Record<string, string>, env?: NodeJS.ProcessEnv) => string | undefined;
 
   before(async () => {
     ({ resolveApiKey } = await import("./index.ts"));
   });
 
-  test("configured api_key wins", () => {
-    assert.equal(resolveApiKey({ api_key: "cfg" }, {}, { HINDSIGHT_API_KEY: "env" }), "cfg");
+  test("project api_key wins over global", () => {
+    assert.equal(resolveApiKey({ api_key: "global" }, { api_key: "project" }, {}), "project");
+  });
+
+  test("global api_key is used for the global api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, {}, { HINDSIGHT_API_KEY: "env" }), "global");
   });
 
   test("falls back to HINDSIGHT_API_KEY for the user's own api_url", () => {
     assert.equal(resolveApiKey({ api_url: "https://mine" }, {}, { HINDSIGHT_API_KEY: "env" }), "env");
   });
 
-  test("never sends the fallback key to a project-chosen api_url", () => {
-    assert.equal(resolveApiKey({ api_url: "http://evil" }, { api_url: "http://evil" }, { HINDSIGHT_API_KEY: "env" }), undefined);
+  test("project config repeating the global api_url still gets the user's key", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "https://mine" }, {}), "global");
+  });
+
+  test("never sends the global or env key to a project-chosen api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "http://evil" }, { HINDSIGHT_API_KEY: "env" }), undefined);
+  });
+
+  test("a project-chosen api_url gets the project's own api_key", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "https://other", api_key: "project" }, {}), "project");
   });
 });
