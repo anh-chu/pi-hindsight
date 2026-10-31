@@ -83,6 +83,20 @@ function readKeychainApiKey(): string | undefined {
   return keychainApiKey || undefined;
 }
 
+/**
+ * The env and keyring keys belong to the user, so they only go to a server the user chose.
+ * A project's .hindsight/config that sets api_url gets no fallback key.
+ */
+export function resolveApiKey(
+  merged: Record<string, string>,
+  local: Record<string, string>,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (merged.api_key) return merged.api_key;
+  if (local.api_url) return undefined;
+  return env.HINDSIGHT_API_KEY || readKeychainApiKey();
+}
+
 function getConfig(): HindsightConfig | null {
   try {
     const globalCfgPath = join(homedir(), ".hindsight", "config");
@@ -111,7 +125,7 @@ function getConfig(): HindsightConfig | null {
     const homedir_project = merged.homedir_project === "false" ? false : true;
     return {
       api_url: merged.api_url,
-      api_key: merged.api_key || process.env.HINDSIGHT_API_KEY || readKeychainApiKey(),
+      api_key: resolveApiKey(merged, local),
       global_bank: merged.global_bank,
       project_bank_id: merged.project_bank_id,
       recall_types,
