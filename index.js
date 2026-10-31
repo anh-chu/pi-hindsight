@@ -61,15 +61,14 @@ function readKeychainApiKey() {
     return keychainApiKey || undefined;
 }
 /**
- * The env and keyring keys belong to the user, so they only go to a server the user chose.
- * A project's .hindsight/config that sets api_url gets no fallback key.
+ * The user's keys (global config, env, keyring) only go to a server the user chose.
+ * If a project's .hindsight/config points api_url somewhere else, only that project's
+ * own api_key is sent.
  */
-export function resolveApiKey(merged, local, env = process.env) {
-    if (merged.api_key)
-        return merged.api_key;
-    if (local.api_url)
-        return undefined;
-    return env.HINDSIGHT_API_KEY || readKeychainApiKey();
+export function resolveApiKey(global, local, env = process.env) {
+    if (local.api_url && local.api_url !== global.api_url)
+        return local.api_key;
+    return local.api_key || global.api_key || env.HINDSIGHT_API_KEY || readKeychainApiKey();
 }
 function getConfig() {
     try {
@@ -96,7 +95,7 @@ function getConfig() {
         const homedir_project = merged.homedir_project === "false" ? false : true;
         return {
             api_url: merged.api_url,
-            api_key: resolveApiKey(merged, local),
+            api_key: resolveApiKey(global, local),
             global_bank: merged.global_bank,
             project_bank_id: merged.project_bank_id,
             recall_types,
