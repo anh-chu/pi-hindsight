@@ -1488,3 +1488,23 @@ describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps
     assert.equal(merged.global_bank, "");
   });
 });
+
+describe("resolveApiKey", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let resolveApiKey: (merged: Record<string, string>, local: Record<string, string>, env?: NodeJS.ProcessEnv) => string | undefined;
+
+  before(async () => {
+    ({ resolveApiKey } = await import("./index.ts"));
+  });
+
+  test("configured api_key wins", () => {
+    assert.equal(resolveApiKey({ api_key: "cfg" }, {}, { HINDSIGHT_API_KEY: "env" }), "cfg");
+  });
+
+  test("falls back to HINDSIGHT_API_KEY for the user's own api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "https://mine" }, {}, { HINDSIGHT_API_KEY: "env" }), "env");
+  });
+
+  test("never sends the fallback key to a project-chosen api_url", () => {
+    assert.equal(resolveApiKey({ api_url: "http://evil" }, { api_url: "http://evil" }, { HINDSIGHT_API_KEY: "env" }), undefined);
+  });
+});

@@ -6,8 +6,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { join, basename, dirname } from "node:path";
+import { homedir, userInfo } from "node:os";
+import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,46 @@ function parseConfigFile(filePath: string): Record<string, string> {
   }
   return config;
 }
+/**
+ * API key from the OS keyring, for processes not started from a login shell (e.g. desktop
+ * apps that never see ~/.zshrc). macOS: Keychain item service "hindsight", account = OS
+ * user, read from the login keychain by path (SSH sessions don't search it by default).
+ * Linux: libsecret item `service=hindsight` (store with `secret-tool store --label
+ * Hindsight service hindsight`). Cached per process; empty when absent.
+ */
+let keychainApiKey: string | undefined;
+function readKeychainApiKey(): string | undefined {
+  if (keychainApiKey !== undefined) return keychainApiKey || undefined;
+  const command: [string, string[]] | undefined =
+    process.platform === "darwin"
+      ? ["security", ["find-generic-password", "-s", "hindsight", "-a", userInfo().username, "-w", join(homedir(), "Library", "Keychains", "login.keychain-db")]]
+      : process.platform === "linux"
+        ? ["secret-tool", ["lookup", "service", "hindsight"]]
+        : undefined;
+  try {
+    keychainApiKey = command
+      ? execFileSync(command[0], command[1], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim()
+      : "";
+  } catch {
+    keychainApiKey = "";
+  }
+  return keychainApiKey || undefined;
+}
+
+/**
+ * The env and keyring keys belong to the user, so they only go to a server the user chose.
+ * A project's .hindsight/config that sets api_url gets no fallback key.
+ */
+export function resolveApiKey(
+  merged: Record<string, string>,
+  local: Record<string, string>,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (merged.api_key) return merged.api_key;
+  if (local.api_url) return undefined;
+  return env.HINDSIGHT_API_KEY || readKeychainApiKey();
+}
+
 function getConfig(): HindsightConfig | null {
   try {
     const globalCfgPath = join(homedir(), ".hindsight", "config");
@@ -84,7 +125,7 @@ function getConfig(): HindsightConfig | null {
     const homedir_project = merged.homedir_project === "false" ? false : true;
     return {
       api_url: merged.api_url,
-      api_key: merged.api_key,
+      api_key: resolveApiKey(merged, local),
       global_bank: merged.global_bank,
       project_bank_id: merged.project_bank_id,
       recall_types,
@@ -227,9 +268,47 @@ export function applyEnvOverrides(merged: Record<string, string>): void {
   }
 }
 
+/**
+ * Project name for a directory: the main repository's folder name when inside git, so every
+ * worktree (e.g. ~/.t3/worktrees/<repo>/<branch>) and subfolder of a repo shares one bank on
+ * every machine. Outside git, or if git fails, the folder name (the pre-worktree behavior).
+ */
+const projectNameCache = new Map<string, string>();
+export function projectNameForCwd(cwd: string): string {
+  const cached = projectNameCache.get(cwd);
+  if (cached) return cached;
+  let name = basename(cwd);
+  try {
+    const [commonDir, topLevel] = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000 },
+    ).trim().split("\n");
+    // Normal repo or linked worktree: <main checkout>/.git. Bare repo with worktrees:
+    // <name>.git. Submodules and separate git dirs keep their git data elsewhere, so use
+    // their own checkout's folder name.
+    if (commonDir?.endsWith("/.git")) name = basename(dirname(commonDir));
+    else if (commonDir?.endsWith(".git")) name = basename(commonDir, ".git");
+    else if (topLevel) name = basename(topLevel);
+  } catch {}
+  projectNameCache.set(cwd, name);
+  return name;
+}
+
 function getProjectBank(config?: HindsightConfig | null): string {
   if (config?.project_bank_id) return config.project_bank_id;
-  return `project-${basename(sessionCwd)}`;
+  return `project-${projectNameForCwd(sessionCwd)}`;
+}
+
+/**
+ * Bank this folder used before banks followed the repository. Recall still reads it so memories
+ * saved from a subfolder or worktree under its folder name stay reachable; new retains go to
+ * getProjectBank().
+ */
+function getLegacyProjectBank(config?: HindsightConfig | null): string | undefined {
+  if (config?.project_bank_id) return undefined;
+  const legacy = `project-${basename(sessionCwd)}`;
+  return legacy === getProjectBank(config) ? undefined : legacy;
 }
 
 function isHomeDirSession(): boolean {
@@ -242,6 +321,8 @@ function getRecallBanks(config: HindsightConfig): string[] {
   // Skip project bank in homedir when homedir_project is disabled
   if (!(isHomeDirSession() && config.homedir_project === false)) {
     banks.add(getProjectBank(config));
+    const legacy = getLegacyProjectBank(config);
+    if (legacy) banks.add(legacy);
   }
   return Array.from(banks);
 }
@@ -520,7 +601,15 @@ async function fetchWithRateLimitRetry(
   throw new Error("unreachable");
 }
 
+export function isSubagentChildProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PI_SUBAGENT_CHILD === "1";
+}
+
 export default function hindsightExtension(pi: ExtensionAPI) {
+  if (isSubagentChildProcess()) {
+    log("extension disabled in PI_SUBAGENT_CHILD session");
+    return;
+  }
   let recallDone = false;
   let recallAttempts = 0;
   let retainSuccessCount = 0;
@@ -973,6 +1062,12 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     }
 
     const banks = getRetainBanks(config, lastUserPrompt);
+    // Home-dir session with homedir_project=false and no #global/#me: nothing to retain.
+    // Returning here keeps an empty bank list from being reported as a failed retain.
+    if (banks.length === 0) {
+      log("agent_end: no retain banks, skipping");
+      return;
+    }
 
     // Count this attempt (before the retain APIs)
     retainEligibleCount++;
@@ -1006,39 +1101,45 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         })
       );
       retainPromise.then((results) => {
-        const succeededBanks = results
-          .filter(r => r.status === "fulfilled")
-          .map(r => (r as PromiseFulfilledResult<string>).value);
-        const allFailed = succeededBanks.length === 0;
-        hookStats.retain = {
-          firedAt: new Date().toISOString(),
-          result: allFailed ? "failed" : "ok",
-          detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
-        };
-        if (!allFailed) retainSuccessCount++;
-        const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-        const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
-        if (allFailed) {
-          log("agent_end: async retain - all banks failed");
-          pi.sendMessage(
-            { customType: "hindsight-retain-failed", content: "", display: true },
-            { deliverAs: "nextTurn" }
-          );
-          if (showStatus) {
-            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-          }
-        } else {
-          log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-          if (showStatus) {
-            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-          }
-          if (showMessage) {
+        try {
+          const succeededBanks = results
+            .filter(r => r.status === "fulfilled")
+            .map(r => (r as PromiseFulfilledResult<string>).value);
+          const allFailed = succeededBanks.length === 0;
+          hookStats.retain = {
+            firedAt: new Date().toISOString(),
+            result: allFailed ? "failed" : "ok",
+            detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+          };
+          if (!allFailed) retainSuccessCount++;
+          const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
+          const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
+          if (allFailed) {
+            log("agent_end: async retain - all banks failed");
             pi.sendMessage(
-              { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
+              { customType: "hindsight-retain-failed", content: "", display: true },
               { deliverAs: "nextTurn" }
             );
+            if (showStatus) {
+              ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+            }
+          } else {
+            log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
+            if (showStatus) {
+              ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+            }
+            if (showMessage) {
+              pi.sendMessage(
+                { customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } },
+                { deliverAs: "nextTurn" }
+              );
+            }
           }
+        } catch (error) {
+          log(`agent_end: async retain feedback skipped: ${String(error)}`);
         }
+      }).catch((error) => {
+        log(`agent_end: async retain failed: ${String(error)}`);
       });
       return;
     }

@@ -46,13 +46,11 @@
   "author": "",
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
     "@marcfargas/pi-test-harness": "^0.5.0",
