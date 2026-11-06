@@ -46,6 +46,8 @@ interface HindsightConfig {
   recall_enabled?: boolean;
   retain_enabled?: boolean;
   homedir_project?: boolean;
+  retain_tags?: string[];
+  observation_scopes?: string;
 }
 
 function parseConfigFile(filePath: string): Record<string, string> {
@@ -123,6 +125,11 @@ function getConfig(): HindsightConfig | null {
     const recall_enabled = merged.recall_enabled === "false" ? false : true;
     const retain_enabled = merged.retain_enabled === "false" ? false : true;
     const homedir_project = merged.homedir_project === "false" ? false : true;
+    const retain_tags = (merged.retain_tags || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    const observation_scopes = merged.observation_scopes?.trim() || undefined;
     return {
       api_url: merged.api_url,
       api_key: resolveApiKey(global, local),
@@ -137,6 +144,8 @@ function getConfig(): HindsightConfig | null {
       recall_enabled,
       retain_enabled,
       homedir_project,
+      retain_tags,
+      observation_scopes,
     };
   } catch (e) {
     return null;
@@ -250,6 +259,8 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
 //                               global_bank stays in the recall mix. (pi-hindsight
 //                               has no tag-scoped scoping; see README.)
 //   Any other HINDSIGHT_SCOPING value is ignored.
+//   HINDSIGHT_RETAIN_TAGS       Comma-separated static tags stamped on every
+//                               retain (identity for shared-bank setups).
 //
 // HINDSIGHT_RETAIN_EVERY_N_TURNS (omp) has no equivalent here: retain runs at
 // agent_end on every turn, so it is deliberately not read.
@@ -258,13 +269,19 @@ function getConfigWithSource(): { global: Record<string, string>; local: Record<
 // unaffected.
 export function applyEnvOverrides(merged: Record<string, string>): void {
   const bank = process.env.HINDSIGHT_BANK_ID?.trim();
-  if (!bank) return;
-  const scoping = (process.env.HINDSIGHT_SCOPING || "").trim();
-  merged.project_bank_id = bank;
-  // An explicitly selected bank must also work from the home directory.
-  merged.homedir_project = "true";
-  if (scoping === "global") {
-    merged.global_bank = "";
+  if (bank) {
+    const scoping = (process.env.HINDSIGHT_SCOPING || "").trim();
+    merged.project_bank_id = bank;
+    // An explicitly selected bank must also work from the home directory.
+    merged.homedir_project = "true";
+    if (scoping === "global") {
+      merged.global_bank = "";
+    }
+  }
+  // Static identity tags per deployment (env beats config, like HINDSIGHT_BANK_ID).
+  const retainTags = process.env.HINDSIGHT_RETAIN_TAGS?.trim();
+  if (retainTags) {
+    merged.retain_tags = retainTags;
   }
 }
 
@@ -798,7 +815,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${config.api_key || ""}`
           },
-          body: JSON.stringify({ items: [{ content, context: "pi coding session: explicit user save", timestamp: new Date().toISOString() }], async: false })
+          body: JSON.stringify({ items: [{ content, context: "pi coding session: explicit user save", timestamp: new Date().toISOString(), ...((config.retain_tags?.length ?? 0) > 0 && { tags: config.retain_tags }), ...(config.observation_scopes && { observation_scopes: config.observation_scopes }) }], async: false })
         });
         if (res.ok) return { content: [{ type: "text" as const, text: "Memory explicitly retained." }], details: {} };
         return { content: [{ type: "text" as const, text: "Failed to retain memory." }], details: {}, isError: true };
@@ -1049,6 +1066,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     const extractedTags = Array.from(lastUserPrompt.matchAll(/(?<=^|\s)#([a-zA-Z0-9_-]+)/g))
       .map(match => match[1].toLowerCase())
       .filter(tag => !reservedTags.has(tag));
+    // Static tags from retain_tags / HINDSIGHT_RETAIN_TAGS always apply (identity),
+    // then prompt #hashtags; deduped, static first.
+    const allTags = [...new Set([...(config.retain_tags || []), ...extractedTags])];
 
     // Strip memory tags to prevent feedback loop
     transcript = transcript.replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, "");
@@ -1090,7 +1110,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
                 update_mode: "append",
                 context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
                 timestamp: new Date().toISOString(),
-                ...(extractedTags.length > 0 && { tags: extractedTags })
+                ...(allTags.length > 0 && { tags: allTags }),
+                ...(config.observation_scopes && { observation_scopes: config.observation_scopes })
               }],
               async: true
             })
@@ -1146,7 +1167,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     // Sync retain (original behavior)
     try {
-      log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
+      log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${allTags.join(",")}`);
 
       const results = await Promise.allSettled(
         banks.map(async (bank) => {
@@ -1163,7 +1184,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
                 update_mode: "append",
                 context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
                 timestamp: new Date().toISOString(),
-                ...(extractedTags.length > 0 && { tags: extractedTags })
+                ...(allTags.length > 0 && { tags: allTags }),
+                ...(config.observation_scopes && { observation_scopes: config.observation_scopes })
               }],
               async: true
             })
