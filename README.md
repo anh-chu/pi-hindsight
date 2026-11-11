@@ -137,6 +137,7 @@ recall_max_tokens = 512
 | `recall_types` | `observation` | Memory types to search: `observation`, `world`, `experience`. Comma-separated. Each type runs the full retrieval pipeline independently. |
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
+| `reflect_timeout` | `120000` | Timeout in ms for the `hindsight_reflect` tool. Reflect runs an agentic loop server-side and routinely takes 20-120s, so this is deliberately much larger than `recall_timeout`. |
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
 | `recall_enabled` | `true` | Enable automatic recall on the first turn of each session and after compaction. Set `false` to disable auto-recall for this project. Manual `hindsight_recall` tool still works. |
 | `retain_enabled` | `true` | Enable automatic retain after agent turns. Set `false` to disable auto-retain for this project. Manual `hindsight_retain` tool still works. |
