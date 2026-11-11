@@ -1,8 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { readFileSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir, userInfo } from "node:os";
-import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 /**
  * Integration-style tests for the gated retain pipeline: buffer turns in
@@ -67,16 +66,18 @@ async function importFresh() {
 }
 
 describe("gated retain pipeline", () => {
-  let globalConfigBackup: string | undefined;
+  let realHome: string | undefined;
+  let tmpHome: string;
 
   beforeEach(() => {
-    // Point the extension at a test server and enable gating via env-free config
-    const cfgPath = join(homedir(), ".hindsight", "config");
-    try {
-      globalConfigBackup = readFileSync(cfgPath, "utf-8");
-    } catch { globalConfigBackup = undefined; }
-    mkdirSync(join(homedir(), ".hindsight"), { recursive: true });
-    writeFileSync(cfgPath, [
+    // Hermetic HOME: the extension resolves ~/.hindsight/config via os.homedir()
+    // at call time, so pointing HOME at a temp dir isolates it from the real
+    // user config (a previous revision of this test clobbered the real file).
+    realHome = process.env.HOME;
+    tmpHome = mkdtempSync(join(tmpdir(), "pi-hindsight-test-"));
+    process.env.HOME = tmpHome;
+    mkdirSync(join(tmpHome, ".hindsight"), { recursive: true });
+    writeFileSync(join(tmpHome, ".hindsight", "config"), [
       "api_url = http://hindsight.test",
       "api_key = testkey",
       "project_bank_id = pi::test-gate",
@@ -88,11 +89,11 @@ describe("gated retain pipeline", () => {
       fetchCalls.push({ url, body: JSON.parse(init?.body ?? "{}") });
       return { ok: true, status: 200, json: async () => ({}) } as any;
     });
-    // Keep keyring lookups quiet/deterministic
-    vi.mock("node:child_process", async (importOriginal) => {
-      const orig: any = await importOriginal();
-      return { ...orig, execFileSync: (...a: any[]) => { throw new Error("no keyring in tests"); } };
-    });
+  });
+
+  afterEach(() => {
+    if (realHome !== undefined) process.env.HOME = realHome;
+    rmSync(tmpHome, { recursive: true, force: true });
   });
 
   it("buffers turns and retains only when the gate fires", async () => {
