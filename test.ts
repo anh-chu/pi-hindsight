@@ -1539,3 +1539,29 @@ describe("resolveApiKey", { skip: !extensionDepsInstalled && "extension deps not
     assert.equal(resolveApiKey({ api_url: "https://mine", api_key: "global" }, { api_url: "https://other", api_key: "project" }, {}), "project");
   });
 });
+
+// ─── reflect request shape ───────────────────────────────────────────────────
+
+describe("reflect", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  let reflectUrl: (apiUrl: string, bank: string) => string;
+  let reflectText: (data: any) => string;
+
+  before(async () => {
+    ({ reflectUrl, reflectText } = await import("./index.ts"));
+  });
+
+  test("posts to /banks/{bank}/reflect, not /memories/reflect", () => {
+    const url = reflectUrl("https://hindsight.example", "my-bank");
+    assert.equal(url, "https://hindsight.example/v1/default/banks/my-bank/reflect");
+    assert.ok(!url.includes("/memories/reflect"), "reflect is not mounted under /memories");
+  });
+
+  test("reads the synthesis from the text field", () => {
+    assert.equal(reflectText({ text: "answer", based_on: {} }), "answer");
+  });
+
+  test("falls back to synthesis, then to JSON", () => {
+    assert.equal(reflectText({ synthesis: "legacy" }), "legacy");
+    assert.equal(reflectText({ other: 1 }), '{"other":1}');
+  });
+});

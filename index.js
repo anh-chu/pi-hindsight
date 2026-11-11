@@ -88,6 +88,7 @@ function getConfig() {
         const recall_budget = merged.recall_budget || "mid";
         const recall_max_tokens = merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : undefined;
         const recall_timeout = merged.recall_timeout ? parseInt(merged.recall_timeout, 10) : undefined;
+        const reflect_timeout = merged.reflect_timeout ? parseInt(merged.reflect_timeout, 10) : undefined;
         const async_retain = merged.async_retain === "false" ? false : true;
         const retain_feedback = merged.retain_feedback || "status";
         const recall_enabled = merged.recall_enabled === "false" ? false : true;
@@ -107,6 +108,7 @@ function getConfig() {
             recall_budget,
             recall_max_tokens,
             recall_timeout,
+            reflect_timeout,
             async_retain,
             retain_feedback,
             recall_enabled,
@@ -553,6 +555,14 @@ async function fetchWithRateLimitRetry(url, options, label) {
 export function isSubagentChildProcess(env = process.env) {
     return env.PI_SUBAGENT_CHILD === "1";
 }
+/** Reflect lives directly under the bank, not under /memories (unlike recall). */
+export function reflectUrl(apiUrl, bank) {
+    return `${apiUrl}/v1/default/banks/${bank}/reflect`;
+}
+/** Hindsight returns the synthesis in `text`; `synthesis` is kept for older servers. */
+export function reflectText(data) {
+    return data?.text || data?.synthesis || JSON.stringify(data);
+}
 export default function hindsightExtension(pi) {
     if (isSubagentChildProcess()) {
         log("extension disabled in PI_SUBAGENT_CHILD session");
@@ -759,8 +769,8 @@ export default function hindsightExtension(pi) {
             const bank = getProjectBank(config);
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
-                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
+                const timeout = setTimeout(() => controller.abort(), config.reflect_timeout ?? 120000);
+                const res = await fetch(reflectUrl(config.api_url, bank), {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -772,9 +782,9 @@ export default function hindsightExtension(pi) {
                 clearTimeout(timeout);
                 if (res.ok) {
                     const data = await res.json();
-                    return { content: [{ type: "text", text: data.synthesis || JSON.stringify(data) }], details: {} };
+                    return { content: [{ type: "text", text: reflectText(data) }], details: {} };
                 }
-                return { content: [{ type: "text", text: "Failed to reflect." }], details: {}, isError: true };
+                return { content: [{ type: "text", text: `Failed to reflect (HTTP ${res.status}).` }], details: {}, isError: true };
             }
             catch (e) {
                 return { content: [{ type: "text", text: `Error: ${e}` }], details: {}, isError: true };
