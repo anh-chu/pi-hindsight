@@ -3,7 +3,7 @@
  * Fully autonomous memory via lifecycle hooks.
  */
 import { Text } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync, statSync, rmSync, renameSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { homedir, userInfo } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -14,6 +14,88 @@ import { Type } from "@sinclair/typebox";
 const DEBUG = process.env.HINDSIGHT_DEBUG === "1";
 const LOG_PATH = join(homedir(), ".hindsight", "debug.log");
 let sessionCwd = process.cwd();
+// ---------------------------------------------------------------------------
+// JSONL Diagnostics (MEMORY_PIPELINE_PLAN.md WS-P5)
+// ---------------------------------------------------------------------------
+// The durable record of what the memory pipeline did. Every outcome is
+// recorded so a memory-less session is distinguishable from a healthy one:
+// a failed reflect, an empty recall, a dropped retain each get a line here
+// even when the extension fails open and the agent keeps working.
+// Append-only JSONL at ~/.hindsight/diagnostics.log (HINDSIGHT_DIAG_FILE
+// override), rotated to `.1` at ~1MB. Sync writes like the debug log —
+// diagnostics must never reorder, and must never break the extension.
+const DIAG_ROTATE_BYTES = 1_000_000;
+const DIAG_MAX_FIELD_CHARS = 2_000;
+const DIAG_PREVIEW_CHARS = 120;
+/** Resolve the diagnostics file path (HINDSIGHT_DIAG_FILE wins). */
+export function diagFilePath() {
+    const fromEnv = process.env.HINDSIGHT_DIAG_FILE?.trim();
+    return fromEnv || join(homedir(), ".hindsight", "diagnostics.log");
+}
+/** Clip a string for a diag field. */
+export function diagPreview(text, chars = DIAG_PREVIEW_CHARS) {
+    const compact = text.replace(/\s+/g, " ").trim();
+    return compact.length > chars ? `${compact.slice(0, chars)}…` : compact;
+}
+function diagSanitizeFields(fields) {
+    const out = {};
+    for (const [key, value] of Object.entries(fields)) {
+        if (value === undefined)
+            continue;
+        if (typeof value === "string")
+            out[key] = diagClip(value);
+        else if (value instanceof Error)
+            out[key] = diagClip(`${value.name}: ${value.message}`);
+        else if (typeof value === "object" && value !== null) {
+            try {
+                out[key] = diagClip(JSON.stringify(value));
+            }
+            catch {
+                out[key] = "[unserializable]";
+            }
+        }
+        else
+            out[key] = value;
+    }
+    return out;
+}
+function diagClip(text) {
+    return text.length > DIAG_MAX_FIELD_CHARS ? `${text.slice(0, DIAG_MAX_FIELD_CHARS)}…` : text;
+}
+let diagSizeChecked = false;
+/** Record one diagnostics event. Never throws, never blocks. */
+export function diag(event, fields = {}) {
+    if (process.env.HINDSIGHT_DIAG === "0")
+        return; // hard off-switch
+    let line;
+    try {
+        line = JSON.stringify({ t: new Date().toISOString(), event, ...diagSanitizeFields(fields) });
+    }
+    catch {
+        return;
+    }
+    try {
+        const path = diagFilePath();
+        if (!diagSizeChecked) {
+            diagSizeChecked = true;
+            try {
+                const size = statSync(path).size;
+                if (size > DIAG_ROTATE_BYTES) {
+                    rmSync(`${path}.1`, { force: true });
+                    renameSync(path, `${path}.1`);
+                }
+            }
+            catch {
+                // no file yet — the append creates it
+            }
+        }
+        mkdirSync(dirname(path), { recursive: true });
+        appendFileSync(path, `${line}\n`, "utf8");
+    }
+    catch {
+        // Unwritable path, disk full — drop the line.
+    }
+}
 function log(msg) {
     if (!DEBUG)
         return;
@@ -23,6 +105,48 @@ function log(msg) {
         appendFileSync(LOG_PATH, line);
     }
     catch (_) { }
+}
+/** Format the frozen core-memory section. Undefined when there is no core. */
+export function formatCoreSection(core) {
+    if (!core.length)
+        return undefined;
+    return ("[core] Stable preferences and conventions " +
+        "(prioritize recent when conflicting; ignore what is not useful):\n" +
+        core.map((m) => `- ${m.text}`).join("\n"));
+}
+/** Format the once-per-session context section header around a frozen body. */
+export function formatContextSection(body, goalExcerpt) {
+    const goal = goalExcerpt ? ` Recalled for "${goalExcerpt}".` : "";
+    return `[context]${goal}\n${body.trim()}`;
+}
+/** Assemble the injected memory block. Undefined when no section has content. */
+export function buildMemoryBlock(sections) {
+    const parts = [sections.core, sections.context, sections.global].filter(Boolean);
+    if (!parts.length)
+        return undefined;
+    return (`<hindsight_memories>\n` +
+        parts.join("\n\n") +
+        `\nFor deeper lookups, call hindsight_recall or hindsight_reflect.` +
+        `\n</hindsight_memories>`);
+}
+const GOAL_EXCERPT_CHARS = 80;
+function goalExcerptOf(prompt) {
+    const compact = prompt.replace(/\s+/g, " ").trim();
+    return compact.length > GOAL_EXCERPT_CHARS ? `${compact.slice(0, GOAL_EXCERPT_CHARS)}…` : compact;
+}
+/**
+ * Cheap stable fingerprint of one retained turn (djb2 over prompt + transcript
+ * bytes). Used by the write-back growth gate (WS-P4): agent_end can re-fire
+ * for one logical turn when pi retries a run or continues with queued
+ * messages, and the duplicate signal must not double-retain.
+ */
+export function fingerprintTurn(prompt, transcript) {
+    let hash = 5381;
+    const part = `${prompt}\u0000${transcript}`;
+    for (let i = 0; i < part.length; i++) {
+        hash = ((hash << 5) + hash + part.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(16);
 }
 function parseConfigFile(filePath) {
     const raw = readFileSync(filePath, "utf-8");
@@ -101,6 +225,27 @@ function getConfig() {
         const retain_every_n_turns = Math.max(1, parseInt(merged.retain_every_n_turns || "1", 10) || 1);
         const retain_strip_secrets = merged.retain_strip_secrets === "false" ? false : true;
         const retain_max_message_chars = Math.max(200, parseInt(merged.retain_max_message_chars || "4000", 10) || 4000);
+        const max_recall_query_tokens = parseInt(merged.max_recall_query_tokens || "500", 10) || 500;
+        // Auto-inject mode resolution with migration: an explicit recall_enabled=false
+        // means the user opted out of auto-injection entirely ("none"); unset/true
+        // migrates to the new reflect-first default (a behavior change — see README).
+        let auto_inject;
+        const rawMode = (merged.auto_inject || "").trim();
+        if (rawMode === "reflect" || rawMode === "recall" || rawMode === "per_message" || rawMode === "none") {
+            auto_inject = rawMode;
+        }
+        else if (merged.recall_enabled === "false") {
+            auto_inject = "none";
+        }
+        else {
+            auto_inject = "reflect";
+        }
+        const reflect_timeout_ms = parseInt(merged.reflect_timeout_ms || "20000", 10) || 20000;
+        const inject_timeout_ms = parseInt(merged.inject_timeout_ms || "8000", 10) || 8000;
+        const inject_failure_attempts = Math.max(1, parseInt(merged.inject_failure_attempts || "2", 10) || 2);
+        const inject_empty_attempts = Math.max(1, parseInt(merged.inject_empty_attempts || "5", 10) || 5);
+        const min_reflect_prompt_chars = Math.max(1, parseInt(merged.min_reflect_prompt_chars || "8", 10) || 8);
+        const core_memory_max_tokens = Math.max(64, parseInt(merged.core_memory_max_tokens || "256", 10) || 256);
         return {
             api_url: merged.api_url,
             api_key: resolveApiKey(global, local),
@@ -120,6 +265,14 @@ function getConfig() {
             retain_every_n_turns,
             retain_strip_secrets,
             retain_max_message_chars,
+            max_recall_query_tokens,
+            auto_inject,
+            reflect_timeout_ms,
+            inject_timeout_ms,
+            inject_failure_attempts,
+            inject_empty_attempts,
+            min_reflect_prompt_chars,
+            core_memory_max_tokens,
         };
     }
     catch (e) {
@@ -444,12 +597,55 @@ function stripAllMemoryBlocks(content) {
         .replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, "")
         .replace(/Relevant context from memory:[\s\S]*?(?=\n\n|$)/g, "");
 }
+/**
+ * Full prompt hygiene: a superset of stripAllMemoryBlocks that also removes
+ * host-injected wrapper blocks. Hosts and other plugins prepend tagged blocks
+ * (a `<system-reminder>`, a `<context key="…">` instructions entry) ahead of
+ * the user's words; left in, that boilerplate becomes the head of every
+ * recall query and reflect goal, so the search runs on the wrapper and never
+ * reaches what the user actually asked. (MEMORY_PIPELINE_PLAN.md WS-P3)
+ */
+export function stripInjectedMemory(content) {
+    return stripAllMemoryBlocks(content
+        .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/g, "")
+        .replace(/<context\b[^>]*>[\s\S]*?<\/context>/g, ""))
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+/**
+ * Byte-aware token bound for outgoing queries.
+ *
+ * Servers reject recall queries over ~500 tokens with HTTP 400, which costs
+ * the turn its memory on long or non-Latin prompts. A byte-level BPE token
+ * never covers less than one UTF-8 byte, so charging non-ASCII its byte length
+ * is a true ceiling; ASCII is conservatively charged at half a token per
+ * character. The cut preserves the query's head, where the user's ask lives.
+ *
+ * This is a *query-path* bound, distinct from rough chars/4 estimates used
+ * for budget-trimming recalled results (a cap, not a bill).
+ * (MEMORY_PIPELINE_PLAN.md WS-P3)
+ */
+export function boundQueryTokens(text, maxTokens) {
+    if (maxTokens <= 0 || !text)
+        return maxTokens <= 0 ? "" : text;
+    let cost = 0;
+    let end = 0;
+    for (const ch of text) {
+        const cp = ch.codePointAt(0);
+        cost += cp < 0x80 ? 0.5 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (cost > maxTokens)
+            break;
+        end += ch.length;
+    }
+    return text.slice(0, end);
+}
 function sanitizeTranscript(transcript, config) {
     if (config.retain_strip_secrets !== false) {
         transcript = stripSecrets(transcript);
         transcript = stripBase64(transcript);
     }
-    return stripAllMemoryBlocks(transcript);
+    return stripInjectedMemory(transcript);
 }
 /** Trivial-prompt filter: short acknowledgements that carry no memory value. */
 function isTrivialPrompt(prompt) {
@@ -564,10 +760,49 @@ export async function runMissionAutoSetup(config) {
         await setupBankMission(config, bank, isGlobal);
     }
 }
+/** Count diag events in the last 24h from the JSONL log (best-effort). */
+function recentDiagCounts() {
+    try {
+        const path = diagFilePath();
+        if (!existsSync(path))
+            return null;
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const counts = {};
+        // Tail-friendly read: last 512KB is ample for 24h of events at our volume
+        const stat = statSync(path);
+        const fd = openSync(path, "r");
+        try {
+            const start = Math.max(0, stat.size - 512 * 1024);
+            const buf = Buffer.alloc(stat.size - start);
+            readSync(fd, buf, 0, buf.length, start);
+            for (const line of buf.toString("utf8").split("\n")) {
+                if (!line.trim())
+                    continue;
+                let evt;
+                try {
+                    evt = JSON.parse(line);
+                }
+                catch {
+                    continue;
+                }
+                if (!evt?.t || Date.parse(evt.t) < cutoff || !evt.event)
+                    continue;
+                counts[evt.event] = (counts[evt.event] ?? 0) + 1;
+            }
+        }
+        finally {
+            closeSync(fd);
+        }
+        return counts;
+    }
+    catch {
+        return null;
+    }
+}
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
-const MAX_RECALL_ATTEMPTS = 3;
+const MAX_RECALL_ATTEMPTS = 3; // retained: referenced by legacy test.ts simulations
 const RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BACKOFF_MS = [10000, 20000, 40000];
 function isRateLimitError(status, body) {
@@ -600,13 +835,367 @@ async function fetchWithRateLimitRetry(url, options, label) {
 export function isSubagentChildProcess(env = process.env) {
     return env.PI_SUBAGENT_CHILD === "1";
 }
+/** Multi-bank parallel recall with per-bank timeout + rate-limit retry.
+ * Returns per-bank raw result texts (no [Bank:] prefixes — callers format). */
+async function recallBanks(config, banks, query, opts) {
+    let ok = false;
+    let authFailed = false;
+    let rateLimited = false;
+    const reqBody = {
+        query,
+        budget: config.recall_budget,
+        query_timestamp: new Date().toISOString(),
+        types: opts.types ?? config.recall_types,
+    };
+    const maxTokens = opts.maxTokens ?? config.recall_max_tokens;
+    if (maxTokens !== undefined)
+        reqBody.max_tokens = maxTokens;
+    if (opts.tags) {
+        reqBody.tags = opts.tags;
+        reqBody.tags_match = opts.tagsMatch ?? "any_strict";
+    }
+    const perBank = await Promise.all(banks.map(async (bank) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? config.recall_timeout ?? 10000);
+        try {
+            const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${config.api_key || ""}`,
+                },
+                body: JSON.stringify(reqBody),
+                signal: controller.signal,
+            }, `${opts.label}: bank=${bank}`);
+            if (rateLimitExhausted) {
+                rateLimited = true;
+                return [];
+            }
+            if (!res.ok) {
+                if (res.status === 401 || res.status === 403)
+                    authFailed = true;
+                return [];
+            }
+            ok = true;
+            const data = await res.json();
+            return (data.results || []).map((r) => String(r.text));
+        }
+        catch (e) {
+            log(`${opts.label}: bank=${bank} error ${e}`);
+            return [];
+        }
+        finally {
+            clearTimeout(timeout);
+        }
+    }));
+    return { ok, results: perBank.flat(), authFailed, rateLimited };
+}
+/** Single-bank reflect with timeout. 404/405 means the server predates the
+ * v1.2.0 endpoint move — a permanent failure the fallback handles. */
+async function reflectBank(config, bank, query, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        // v1.2.0 moved reflect off the memories subpath (405 on .../memories/reflect).
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/reflect`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${config.api_key || ""}`,
+            },
+            body: JSON.stringify({ query }),
+            signal: controller.signal,
+        });
+        if (!res.ok) {
+            const bodyText = typeof res.text === "function" ? await Promise.resolve(res.text()).catch(() => "") : "";
+            const permanent = res.status >= 400 && res.status < 500 && res.status !== 429;
+            return { ok: false, error: `HTTP ${res.status} ${String(bodyText).slice(0, 120)}`, permanent };
+        }
+        const data = await res.json();
+        const synthesis = typeof data.synthesis === "string" ? data.synthesis : "";
+        return { ok: true, body: synthesis };
+    }
+    catch (e) {
+        return { ok: false, error: String(e) };
+    }
+    finally {
+        clearTimeout(timeout);
+    }
+}
+const RECALL_CACHE_MAX = 100;
+export function createInjectionEngine(args) {
+    const sessions = new Map();
+    function sessionOf() {
+        // pi runs one extension instance per session; a single implicit session slot
+        return sessions.get("") ?? createSession();
+    }
+    function createSession() {
+        const s = {
+            inject: { state: { status: "unresolved" }, failAttempts: 0, emptyAttempts: 0, delivered: false },
+            coreBlock: undefined,
+            coreFetch: null,
+            turns: 0,
+            lastPrompt: undefined,
+            recallCache: new Map(),
+        };
+        sessions.set("", s);
+        return s;
+    }
+    function reset() {
+        sessions.clear();
+    }
+    /** Fetch + freeze the core-memory section once per session. null = empty. */
+    async function ensureCoreFrozen(config) {
+        const s = sessionOf();
+        if (s.coreBlock !== undefined)
+            return;
+        if (s.coreFetch)
+            return await s.coreFetch;
+        const fetch = (async () => {
+            try {
+                const banks = getRecallBanks(config);
+                const startedAt = Date.now();
+                const r = await recallBanks(config, banks, CORE_MEMORY_QUERY, {
+                    timeoutMs: config.recall_timeout ?? 10000,
+                    maxTokens: config.core_memory_max_tokens,
+                    types: ["world"],
+                    tags: ["core"],
+                    tagsMatch: "any_strict",
+                    label: "core-memory",
+                });
+                // Fail-open: a transient failure is indistinguishable from empty; the
+                // cost is a core-less session, never a broken one.
+                s.coreBlock = r.ok ? (formatCoreSection(r.results.map((t) => ({ text: t }))) ?? null) : null;
+                diag("core_loaded", { ms: Date.now() - startedAt, count: r.ok ? r.results.length : -1 });
+            }
+            catch {
+                s.coreBlock = null;
+                diag("core_failed", { error: "exception" });
+            }
+        })();
+        s.coreFetch = fetch;
+        try {
+            await fetch;
+        }
+        finally {
+            s.coreFetch = null;
+        }
+    }
+    const CORE_MEMORY_QUERY = "core memories user preferences project conventions persistent decisions";
+    /** Format recall results as the context body (recall + fallback paths). */
+    function formatRecallBody(results) {
+        return results.map((t) => `- ${t}`).join("\n");
+    }
+    /**
+     * The once-per-session source run. Called only while unresolved and only on
+     * a substantive new prompt. Returns the frozen block for THIS turn if the
+     * answer just arrived (delivery happens here — once — in pi's model).
+     */
+    async function runSource(config, prompt) {
+        const s = sessionOf();
+        const inj = s.inject;
+        if (inj.state.status !== "unresolved")
+            return {};
+        // Trivially short prompts ("hi", "ok") are skipped WITHOUT consuming an
+        // attempt, so an opener doesn't burn the session's synthesis on garbage.
+        const trimmed = prompt.trim();
+        if (trimmed.length < (config.min_reflect_prompt_chars ?? 8)) {
+            log(`inject: skip short prompt (${trimmed.length} chars < ${config.min_reflect_prompt_chars ?? 8})`);
+            diag("inject_skip_short", { len: trimmed.length });
+            return {};
+        }
+        const query = boundQueryTokens(trimmed, config.max_recall_query_tokens ?? 500);
+        const banks = getRecallBanks(config);
+        let source;
+        let globalSection;
+        let viaFallback = false;
+        if (config.auto_inject === "reflect") {
+            // Reflect on the project bank (the session's primary); recall the global
+            // bank in parallel as a trimmed [global] section (WS-P1 multi-bank decision).
+            const projectBank = getProjectBank(config);
+            const reflectPromise = reflectBank(config, projectBank, query, config.reflect_timeout_ms ?? 20000);
+            const globalBank = config.global_bank && config.global_bank !== projectBank ? config.global_bank : null;
+            const globalPromise = globalBank
+                ? recallBanks(config, [globalBank], query, {
+                    timeoutMs: config.inject_timeout_ms ?? 8000,
+                    maxTokens: Math.min(config.recall_max_tokens ?? 512, 256),
+                    label: "inject-global",
+                })
+                : null;
+            source = await reflectPromise;
+            if (globalPromise) {
+                const g = await globalPromise;
+                if (g.ok && g.results.length) {
+                    globalSection = `[global] Cross-project memories:\n${formatRecallBody(g.results.slice(0, 5))}`;
+                }
+            }
+        }
+        else {
+            // "recall" mode: parallel recall across all banks (pre-1.7 behavior)
+            const r = await recallBanks(config, banks, query, {
+                timeoutMs: config.recall_timeout ?? 10000,
+                label: "inject-recall",
+            });
+            source = r.ok
+                ? { ok: true, body: formatRecallBody(r.results) }
+                : { ok: false, error: r.authFailed ? "auth" : r.rateLimited ? "rate-limited" : "unreachable", permanent: r.authFailed };
+        }
+        // ── Reflect fallback chain (WS-P2) ─────────────────────────────────────
+        // A reflect failure does not cost the session its memory: one
+        // retrieval-only recall runs instead, under its own retrieval budget
+        // (inject_timeout_ms, counted from the fallback's start — the same total
+        // budget the official package uses). A non-empty fallback body becomes
+        // the answer; an EMPTY fallback keeps the original result's semantics
+        // (a permanent 4xx still resolves immediately — retrying cannot help).
+        let fallbackBody;
+        if (!source.ok && config.auto_inject === "reflect") {
+            log(`inject: reflect failed (${source.error}), falling back to recall`);
+            diag("reflect_failed", { error: source.error, permanent: source.permanent === true, query: diagPreview(query) });
+            const fb = await recallBanks(config, banks, query, {
+                timeoutMs: config.inject_timeout_ms ?? 8000,
+                label: "inject-fallback",
+            });
+            if (fb.ok && fb.results.length) {
+                fallbackBody = formatRecallBody(fb.results);
+                diag("reflect_fallback_ok", { chars: fallbackBody.length });
+            }
+            else {
+                diag("reflect_fallback_empty");
+            }
+        }
+        if (fallbackBody !== undefined) {
+            source = { ok: true, body: fallbackBody };
+            viaFallback = true;
+        }
+        // ── Resolve the tri-state ──
+        if (source.ok) {
+            const body = source.body.trim();
+            const hasGlobal = globalSection !== undefined;
+            if (body || hasGlobal) {
+                inj.state = { status: "answer", text: body || "", goalExcerpt: goalExcerptOf(trimmed), via: viaFallback ? "fallback" : config.auto_inject };
+                inj.delivered = false;
+                diag("inject_ok", {
+                    chars: body.length,
+                    goal: inj.state.goalExcerpt,
+                    via: inj.state.via,
+                    core: s.coreBlock ? s.coreBlock.length : 0,
+                });
+                const block = buildMemoryBlock({
+                    core: s.coreBlock ?? undefined,
+                    context: body ? formatContextSection(body, inj.state.goalExcerpt) : undefined,
+                    global: globalSection,
+                });
+                return { block: block ?? undefined, snippet: body.slice(0, 200), count: undefined };
+            }
+            // Ran and matched nothing: an empty answer consumes an empty-attempt.
+            inj.emptyAttempts++;
+            if (inj.emptyAttempts >= (config.inject_empty_attempts ?? 5))
+                inj.state = { status: "empty" };
+            log(`inject: empty (attempt ${inj.emptyAttempts}/${config.inject_empty_attempts ?? 5})`);
+            diag("inject_empty", { emptyAttempts: inj.emptyAttempts });
+            return {};
+        }
+        if (source.permanent) {
+            // A 4xx fails identically on every later turn — resolve now rather than
+            // spend the session's second attempt on a call that cannot succeed.
+            inj.state = { status: "empty" };
+            log(`inject: permanent failure (${source.error}), resolving empty`);
+            diag("inject_failed", { permanent: true, error: source.error });
+            return {};
+        }
+        inj.failAttempts++;
+        if (inj.failAttempts >= (config.inject_failure_attempts ?? 2))
+            inj.state = { status: "empty" };
+        log(`inject: failed (attempt ${inj.failAttempts}/${config.inject_failure_attempts ?? 2}): ${source.error}`);
+        diag("inject_failed", { failAttempts: inj.failAttempts, error: source.error });
+        return {};
+    }
+    /** per_message mode: recall for this prompt through the cache. */
+    async function perMessageBlock(config, prompt) {
+        const s = sessionOf();
+        const query = boundQueryTokens(prompt.trim(), config.max_recall_query_tokens ?? 500);
+        const cached = s.recallCache.get(query);
+        let results;
+        if (cached) {
+            results = cached;
+        }
+        else {
+            const r = await recallBanks(config, getRecallBanks(config), query, {
+                timeoutMs: config.recall_timeout ?? 10000,
+                label: "inject-per-message",
+            });
+            results = r.ok ? r.results : [];
+            s.recallCache.set(query, results);
+            if (s.recallCache.size > RECALL_CACHE_MAX) {
+                const first = s.recallCache.keys().next().value;
+                if (first)
+                    s.recallCache.delete(first);
+            }
+        }
+        if (!results.length)
+            return {};
+        const body = formatRecallBody(results);
+        return {
+            block: buildMemoryBlock({ context: formatContextSection(body, goalExcerptOf(prompt)) }),
+            snippet: results[0].slice(0, 200),
+            count: results.length,
+        };
+    }
+    /**
+     * The before_agent_start entry point. Returns the message to inject this
+     * turn, or undefined. In reflect/recall modes the block is computed once and
+     * delivered only on the turn the answer arrived; per_message computes per
+     * substantive prompt.
+     */
+    async function onBeforeAgentStart(config, rawPrompt) {
+        const mode = config.auto_inject;
+        if (mode === "none")
+            return undefined;
+        const s = sessionOf();
+        const prompt = rawPrompt ? boundQueryTokens(stripInjectedMemory(rawPrompt).trim(), config.max_recall_query_tokens ?? 500) : "";
+        s.turns++;
+        if (prompt)
+            s.lastPrompt = prompt;
+        if (mode === "per_message") {
+            if (!prompt)
+                return undefined;
+            const out = await perMessageBlock(config, prompt);
+            if (out.block)
+                args.onInject({ chars: out.block.length, via: mode ?? "reflect", snippet: out.snippet ?? "" });
+            return out;
+        }
+        if (injStateIsDelivered(s))
+            return undefined;
+        if (!prompt)
+            return undefined;
+        // Core freeze runs once, before the first source attempt (fail-open).
+        if (s.coreBlock === undefined) {
+            await ensureCoreFrozen(config);
+        }
+        const out = await runSource(config, prompt);
+        if (out.block) {
+            s.inject.delivered = true;
+            args.onInject({ chars: out.block.length, via: mode ?? "reflect", snippet: out.snippet ?? "" });
+            return out;
+        }
+        return undefined;
+    }
+    function injStateIsDelivered(s) {
+        return s.inject.state.status === "answer" && s.inject.delivered;
+    }
+    return {
+        onBeforeAgentStart,
+        ensureCoreFrozen,
+        reset,
+        sessionOf, // for tests
+    };
+}
 export default function hindsightExtension(pi) {
     if (isSubagentChildProcess()) {
         log("extension disabled in PI_SUBAGENT_CHILD session");
         return;
     }
-    let recallDone = false;
-    let recallAttempts = 0;
+    let recallAttempts = 0; // repurposed: only for "not configured" status-line dedupe
     let retainSuccessCount = 0;
     let retainEligibleCount = 0;
     let currentPrompt = "";
@@ -619,8 +1208,8 @@ export default function hindsightExtension(pi) {
     });
     pi.on("session_start", async (_event, ctx) => {
         sessionCwd = ctx.cwd || process.cwd();
-        recallDone = false;
         recallAttempts = 0;
+        injection.reset();
         hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
         hookStats.recall = {};
         hookStats.retain = {};
@@ -629,6 +1218,7 @@ export default function hindsightExtension(pi) {
         userTurnCount = 0;
         retainedTurnCount = 0;
         pendingTurns = [];
+        lastTurnFingerprint = undefined;
         ctx.ui.setStatus("hindsight", undefined);
         log("session_start: state reset");
         const config = getConfig();
@@ -665,12 +1255,16 @@ export default function hindsightExtension(pi) {
         // turns first so the source material isn't lost.
         await flushPendingTurns(ctx, "compact");
         sessionCwd = ctx.cwd || process.cwd();
-        recallDone = false;
+        // Re-arm the engine: the wiped context needs fresh memory, and this is
+        // deliberately better than the opencode mapping (WS-P1).
+        injection.reset();
         recallAttempts = 0;
         retainSuccessCount = 0;
         retainEligibleCount = 0;
         userTurnCount = 0;
         retainedTurnCount = 0;
+        pendingTurns = [];
+        lastTurnFingerprint = undefined;
         ctx.ui.setStatus("hindsight", undefined);
         log("session_compact: state reset");
     });
@@ -716,9 +1310,13 @@ export default function hindsightExtension(pi) {
             if (!config || !config.api_url)
                 return { content: [{ type: "text", text: "Hindsight not configured." }], details: {}, isError: true };
             const banks = getRecallBanks(config);
+            const boundedQuery = boundQueryTokens(stripInjectedMemory(query).trim(), config.max_recall_query_tokens ?? 500);
+            if (!boundedQuery) {
+                return { content: [{ type: "text", text: "Query is empty after stripping injected memory blocks." }], details: {}, isError: true };
+            }
             try {
                 const recallPromises = banks.map(async (bank) => {
-                    const reqBody = { query, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
+                    const reqBody = { query: boundedQuery, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
                     if (config.recall_max_tokens !== undefined)
                         reqBody.max_tokens = config.recall_max_tokens;
                     const controller = new AbortController();
@@ -815,6 +1413,7 @@ export default function hindsightExtension(pi) {
             try {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
+                const reflectQuery = boundQueryTokens(stripInjectedMemory(query).trim(), config.max_recall_query_tokens ?? 500);
                 // v1.2.0 moved reflect off the memories subpath (405 on .../memories/reflect).
                 const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/reflect`, {
                     method: "POST",
@@ -822,7 +1421,7 @@ export default function hindsightExtension(pi) {
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${config.api_key || ""}`
                     },
-                    body: JSON.stringify({ query }),
+                    body: JSON.stringify({ query: reflectQuery }),
                     signal: controller.signal
                 });
                 clearTimeout(timeout);
@@ -838,133 +1437,35 @@ export default function hindsightExtension(pi) {
         }
     });
     // -----------------------------------------------------------------------
+    const injection = createInjectionEngine({
+        config: getConfig,
+        onInject: ({ chars, via, snippet }) => {
+            hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: `${via}: ${chars} chars` };
+            log(`inject: delivered ${chars} chars via ${via}`);
+            void snippet;
+        },
+    });
     pi.on("before_agent_start", async (_event, ctx) => {
-        if (recallDone) {
-            log("before_agent_start: skip (recallDone=true)");
-            return;
-        }
-        if (recallAttempts >= MAX_RECALL_ATTEMPTS) {
-            log(`before_agent_start: skip (max attempts ${MAX_RECALL_ATTEMPTS} reached)`);
-            return;
-        }
-        recallAttempts++;
-        log(`before_agent_start: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}`);
         const config = getConfig();
         if (!config || !config.api_url) {
-            log("before_agent_start: no config, giving up");
-            recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry - config won't change mid-session
-            ctx.ui.setStatus("hindsight", "⚠ not configured");
+            if (recallAttempts === 0) {
+                recallAttempts = 1; // don't spam the status line every turn
+                ctx.ui.setStatus("hindsight", "⚠ not configured");
+            }
             return;
         }
-        if (config.recall_enabled === false) {
-            log("before_agent_start: recall disabled by config");
-            recallDone = true;
-            return;
-        }
-        const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
-        const banks = getRecallBanks(config);
-        log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
-        try {
-            let anyBankSucceeded = false;
-            let authFailed = false;
-            let rateLimitedFailed = false;
-            const recallPromises = banks.map(async (bank) => {
-                const reqBody = { query: lastUserPrompt, budget: config.recall_budget, query_timestamp: new Date().toISOString(), types: config.recall_types };
-                if (config.recall_max_tokens !== undefined)
-                    reqBody.max_tokens = config.recall_max_tokens;
-                const controller = new AbortController();
-                const timeout = setTimeout(() => {
-                    controller.abort();
-                    log(`before_agent_start: bank=${bank} timed out`);
-                }, config.recall_timeout ?? 10000);
-                try {
-                    const { res, rateLimitExhausted } = await fetchWithRateLimitRetry(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${config.api_key || ""}`
-                        },
-                        body: JSON.stringify(reqBody),
-                        signal: controller.signal
-                    }, `before_agent_start: bank=${bank}`);
-                    if (rateLimitExhausted) {
-                        rateLimitedFailed = true;
-                        return [];
-                    }
-                    if (!res.ok) {
-                        if (res.status === 401 || res.status === 403)
-                            authFailed = true;
-                        return [];
-                    }
-                    anyBankSucceeded = true;
-                    const data = await res.json();
-                    const results = (data.results || []).map((r) => `[Bank: ${bank}] - ${r.text}`);
-                    log(`before_agent_start: bank=${bank} got ${results.length} results`);
-                    return results;
-                }
-                catch (e) {
-                    log(`before_agent_start: bank=${bank} error ${e}`);
-                    return [];
-                }
-                finally {
-                    clearTimeout(timeout);
-                }
-            });
-            const resultsArrays = await Promise.all(recallPromises);
-            if (authFailed) {
-                hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
-                recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
-                ctx.ui.setStatus("hindsight", "✗ auth error - check api_key");
-                log("before_agent_start: auth error, giving up");
-                return;
-            }
-            if (rateLimitedFailed) {
-                hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "rate limited" };
-                recallAttempts = MAX_RECALL_ATTEMPTS;
-                ctx.ui.setStatus("hindsight", "✗ rate-limited (reranker quota exceeded)");
-                log("before_agent_start: rate-limited, giving up");
-                return;
-            }
-            if (anyBankSucceeded) {
-                recallDone = true;
-                ctx.ui.setStatus("hindsight", undefined);
-                const allResults = resultsArrays.flat();
-                if (allResults.length > 0) {
-                    hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: `${allResults.length} memories` };
-                    log(`before_agent_start: injecting ${allResults.length} memories into context`);
-                    const memoriesStr = allResults.join("\n\n");
-                    const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
-                    const count = allResults.length;
-                    const snippet = allResults
-                        .slice(0, 3)
-                        .map((r) => r.replace(/^\[Bank: [^\]]+\] - /, ""))
-                        .join(" \u00b7 ")
-                        .slice(0, 200);
-                    return {
-                        message: {
-                            customType: "hindsight-recall",
-                            content,
-                            display: true,
-                            details: { count, snippet }
-                        }
-                    };
-                }
-                else {
-                    hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "vault empty" };
-                    log("before_agent_start: no memories found (empty vault)");
-                }
-            }
-            else {
-                const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
-                hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: isLastAttempt ? "unreachable" : "retrying" };
-                ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
-                log(`before_agent_start: all banks failed, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
-            }
-        }
-        catch (e) {
-            const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
-            ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
-            log(`before_agent_start: error ${e}, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
+        const rawPrompt = getLastUserMessage(ctx, currentPrompt);
+        const out = await injection.onBeforeAgentStart(config, rawPrompt);
+        if (out?.block) {
+            ctx.ui.setStatus("hindsight", undefined);
+            return {
+                message: {
+                    customType: "hindsight-recall",
+                    content: out.block,
+                    display: true,
+                    details: { count: out.count ?? 0, snippet: (out.snippet ?? "").slice(0, 200) },
+                },
+            };
         }
     });
     // -----------------------------------------------------------------------
@@ -976,6 +1477,10 @@ export default function hindsightExtension(pi) {
     let pendingTurns = [];
     let userTurnCount = 0;
     let retainedTurnCount = 0;
+    // Growth fingerprint (WS-P4): fingerprint of the last buffered turn. A
+    // retried or queued-message run can re-fire agent_end with the same
+    // prompt + assistant content; the same logical turn must be retained once.
+    let lastTurnFingerprint;
     function buildTurnTranscript(event, lastUserPrompt, config) {
         let transcript = `[role: user]\n${lastUserPrompt}\n[user:end]\n\n[role: assistant]\n`;
         const messages = event.messages || [];
@@ -1054,12 +1559,14 @@ export default function hindsightExtension(pi) {
                     result: "ok",
                     detail: `${buffer.length} turns → ${succeeded}/${results.length} banks`,
                 };
+                diag("retain_ok", { turns: buffer.length, banks: succeeded, trigger: reason, doc: `session-${sessionId}` });
                 if (ctx.ui?.setStatus && (config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback)) {
                     ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
                 }
             }
             else {
                 hookStats.retain = { firedAt: new Date().toISOString(), result: "failed", detail: "all banks unreachable" };
+                diag("retain_failed", { turns: buffer.length, trigger: reason, error: "all banks unreachable" });
                 if (ctx.ui?.setStatus && (config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback)) {
                     ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
                 }
@@ -1110,6 +1617,15 @@ export default function hindsightExtension(pi) {
         if (transcript.length > 50000) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
+        // Growth fingerprint (WS-P4), computed over the exact retained bytes:
+        // an identical prompt + assistant content re-delivered by a retried run
+        // is the same logical turn — buffer it once.
+        const turnFingerprint = fingerprintTurn(lastUserPrompt, transcript);
+        if (turnFingerprint === lastTurnFingerprint) {
+            log("agent_end: duplicate run signal (fingerprint match), skipping");
+            return;
+        }
+        lastTurnFingerprint = turnFingerprint;
         userTurnCount++;
         pendingTurns.push({ prompt: lastUserPrompt, transcript, tags: allTags });
         const gate = config.retain_every_n_turns ?? 1;
@@ -1219,6 +1735,20 @@ export default function hindsightExtension(pi) {
                 }
                 else {
                     lines.push("Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)");
+                }
+                // Diagnostics (last 24h)
+                const diagCounts = recentDiagCounts();
+                if (diagCounts) {
+                    const entries = Object.entries(diagCounts).sort((a, b) => b[1] - a[1]);
+                    if (entries.length) {
+                        lines.push(`Diagnostics (last 24h, ${diagFilePath()}):`);
+                        for (const [event, count] of entries.slice(0, 8)) {
+                            lines.push(`  ${event}: ${count}`);
+                        }
+                    }
+                    else {
+                        lines.push(`Diagnostics: no events in the last 24h`);
+                    }
                 }
                 ctx.ui.notify(lines.join("\n"), hasError ? "error" : "info");
                 return;
@@ -1354,6 +1884,7 @@ export default function hindsightExtension(pi) {
             }
             const status = [
                 `URL: ${config.api_url || "Not set"}`,
+                `Auto-Inject: ${config.auto_inject}`,
                 `Global Bank: ${config.global_bank || "Not set"}`,
                 `Project Bank (Recall & Default Retain): ${getProjectBank(config)}`,
                 `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,

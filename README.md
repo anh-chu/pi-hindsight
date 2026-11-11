@@ -48,16 +48,27 @@ pi install git:github.com/anh-chu/pi-hindsight
    /hindsight status
    ```
 
-That's it. Memory is fully automatic from here: recall on the first turn of each session (and again after compaction), retain after each turn, no manual intervention needed.
+That's it. Memory is fully automatic from here: one synthesis injected on the first substantive turn of each session (and again after compaction), retain after each turn, no manual intervention needed.
 
 ## Features
 
 ### Automatic memory lifecycle
 
-- **Auto-recall:** On the first turn of each session, and again after compaction, relevant memories from your project and global banks are injected into the prompt. Mid-session, the agent can call `hindsight_recall` on demand.
-- **Auto-retain:** After each agent turn, the conversation is appended to a per-session memory document. Only the new delta is processed, no redundant work.
+- **Auto-inject (reflect-first):** On the first substantive turn of each session, and again after compaction, the agent injects a single memory block: a server-side **reflect synthesis** of your project bank for the session's goal, a frozen `[core]` section of stable preferences (`core`-tagged memories), and — when a global bank is configured — a `[global]` section of cross-project hits. The block is injected exactly once per session and never re-sent, so the provider prefix cache stays valid. Mid-session, the agent can call `hindsight_recall` / `hindsight_reflect` on demand.
+- **Auto-retain:** After each agent turn, the conversation is appended to a per-session memory document. Only the new delta is processed, no redundant work. A retried or regenerated run that re-delivers identical content is fingerprinted and skipped — each logical turn is retained exactly once.
 - **Feedback loop prevention:** Memory blocks are stripped from retained content. No recursive memory bloat.
 - **Noise filtering:** Low-signal tool calls (bash, read, write, edit) are dropped from retained transcripts. Conversation and meaningful tool usage are kept.
+
+#### Auto-inject modes
+
+| Mode | Behavior |
+|---|---|
+| `reflect` *(default)* | One server-side synthesis per session, injected on the turn it ran. Reflects the project bank; recalls the global bank in parallel. On a reflect failure, one retrieval-only recall runs as a fallback. |
+| `recall` | The pre-1.7 behavior: one parallel recall across all banks on the first substantive turn. |
+| `per_message` | Recall on every substantive user turn (the pre-pipeline behavior; costs one recall per turn). |
+| `none` | No auto-injection; the manual tools still work. |
+
+Failure semantics: a failed synthesis retries on a later turn (up to `inject_failure_attempts`), an empty result retries up to `inject_empty_attempts`, and a permanent 4xx resolves immediately. Trivially short prompts ("hi") never consume an attempt.
 
 ### Per-prompt controls
 
@@ -137,11 +148,19 @@ recall_max_tokens = 512
 | `recall_types` | `observation` | Memory types to search: `observation`, `world`, `experience`. Comma-separated. Each type runs the full retrieval pipeline independently. |
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
+| `max_recall_query_tokens` | `500` | Approximate token ceiling for outgoing recall/reflect queries (byte-aware estimator: ASCII ≈ 0.5 token/char, non-ASCII by UTF-8 byte length). Hindsight servers reject queries over ~500 tokens with HTTP 400, which silently costs the turn its memory — this bound prevents that by truncating the query head-first. Applies to auto-recall and the `hindsight_recall` / `hindsight_reflect` tools. |
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
 | `retain_every_n_turns` | `1` | Retain only every N user turns instead of every turn. Unretained turns are buffered and flushed on session shutdown and before compaction, so nothing is lost. `1` preserves the previous retain-every-turn behavior. |
 | `retain_strip_secrets` | `true` | Strip likely secrets (bearer tokens, API keys, GitHub/AWS tokens, private keys) and large base64 blobs from retained transcripts before sending them to the server. |
 | `retain_max_message_chars` | `4000` | Per-message character cap applied to each retained message/tool payload, in addition to the hard 50 000-character transcript cap. |
-| `recall_enabled` | `true` | Enable automatic recall on the first turn of each session and after compaction. Set `false` to disable auto-recall for this project. Manual `hindsight_recall` tool still works. |
+| `recall_enabled` | `true` | Legacy master switch for auto-injection. `false` migrates to `auto_inject = "none"`. Prefer setting `auto_inject` directly. Manual `hindsight_recall` tool still works. |
+| `auto_inject` | `reflect` | `reflect` \| `recall` \| `per_message` \| `none`. See [Auto-inject modes](#auto-inject-modes). |
+| `reflect_timeout_ms` | `20000` | Timeout for the auto-inject reflect call. The `hindsight_reflect` tool stays unbounded. |
+| `inject_timeout_ms` | `8000` | Shared retrieval budget for the reflect fallback chain and the global-bank side recall, counted from that call's start. |
+| `inject_failure_attempts` | `2` | Turns a failing auto-inject source may retry before resolving empty. |
+| `inject_empty_attempts` | `5` | Turns an empty auto-inject source may retry before resolving empty. |
+| `min_reflect_prompt_chars` | `8` | Prompts shorter than this skip auto-inject without consuming an attempt. |
+| `core_memory_max_tokens` | `256` | Token cap for the frozen `[core]` section (`core`-tagged, `world`-type memories). |
 | `retain_enabled` | `true` | Enable automatic retain after agent turns. Set `false` to disable auto-retain for this project. Manual `hindsight_retain` tool still works. |
 | `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. |
 | `global_bank` | _(none)_ | Bank ID for cross-project memory. When set, this bank is queried alongside the project bank on every recall. Turns tagged `#global` or `#me` are also retained here. Leave unset if you only want per-project memory. |
@@ -239,6 +258,35 @@ HINDSIGHT_BANK_ID=team-memory HINDSIGHT_RETAIN_TAGS="agent:pi-build01" pi
 ## Debug logging
 
 Set `HINDSIGHT_DEBUG=1` to enable verbose logging to `~/.hindsight/debug.log`. Log tail is shown inline in `/hindsight status`.
+
+## Diagnostics
+
+The extension writes append-only JSONL diagnostics to `~/.hindsight/diagnostics.log` (override with `HINDSIGHT_DIAG_FILE`; disable with `HINDSIGHT_DIAG=0`), rotated to `.1` at ~1MB. Every pipeline outcome gets a line — `inject_ok`, `inject_empty`, `inject_failed`, `inject_skip_short`, `reflect_failed`, `reflect_fallback_ok`/`_empty`, `core_loaded`/`core_failed`, `retain_ok`/`retain_failed` — so a memory-less session is distinguishable from a healthy one in the log even though the extension fails open. `/hindsight status` shows per-event counts for the last 24 hours.
+
+```jsonc
+{"t":"…","event":"inject_ok","chars":1180,"via":"reflect","goal":"refactor the ingestion pipeline…","core":212}
+{"t":"…","event":"retain_ok","turns":1,"banks":1,"trigger":"gate:1","doc":"session-abc123"}
+```
+
+## Migration to 1.7.0 (memory pipeline parity)
+
+Version 1.7.0 adopts the injection mechanics of the official Vectorize coding-agents integration (and of our sibling opencode plugin). **The default auto-inject mode changes from per-session recall to per-session reflect synthesis.** What changes:
+
+- The first substantive turn now injects a server-side **reflect synthesis** (denser, goal-aware) plus a frozen `[core]` section, instead of a raw recall list. Mid-session, use the `hindsight_recall` / `hindsight_reflect` tools for fresh lookups.
+- One injection per session (and one more after compaction), never re-sent — the provider prefix cache stays valid.
+- Reflect failures fall back to a single bounded recall; failures retry on later turns within a small attempt budget.
+- Queries are hygiene-stripped and byte-bounded (no more silent 400s on long or non-Latin prompts).
+- Retains are fingerprinted so retried runs never double-retain a turn.
+
+To keep the old behavior, set:
+
+```toml
+auto_inject = "recall"      # one parallel recall per session (pre-1.7)
+# or
+auto_inject = "per_message"  # recall on every turn (pre-1.5 behavior)
+```
+
+`recall_enabled = false` continues to work and now maps to `auto_inject = "none"`.
 
 ## Performance
 
