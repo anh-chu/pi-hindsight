@@ -138,6 +138,9 @@ recall_max_tokens = 512
 | `recall_budget` | `mid` | Retrieval depth: `low`, `mid`, `high`. Higher = more coverage but added latency. |
 | `recall_max_tokens` | Server default (4096) | Max tokens for injected memories. Lower values reduce context noise. Recommended: `800`. |
 | `async_retain` | `true` | Non-blocking retain. Set `false` for sync retain with failure notifications. |
+| `retain_every_n_turns` | `1` | Retain only every N user turns instead of every turn. Unretained turns are buffered and flushed on session shutdown and before compaction, so nothing is lost. `1` preserves the previous retain-every-turn behavior. |
+| `retain_strip_secrets` | `true` | Strip likely secrets (bearer tokens, API keys, GitHub/AWS tokens, private keys) and large base64 blobs from retained transcripts before sending them to the server. |
+| `retain_max_message_chars` | `4000` | Per-message character cap applied to each retained message/tool payload, in addition to the hard 50 000-character transcript cap. |
 | `recall_enabled` | `true` | Enable automatic recall on the first turn of each session and after compaction. Set `false` to disable auto-recall for this project. Manual `hindsight_recall` tool still works. |
 | `retain_enabled` | `true` | Enable automatic retain after agent turns. Set `false` to disable auto-retain for this project. Manual `hindsight_retain` tool still works. |
 | `homedir_project` | `true` | Treat home directory as a project. Set `false` to prevent creating a `project-<username>` bank when running Pi from your home directory. Recall and retain use only `global_bank` instead. |

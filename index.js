@@ -98,6 +98,9 @@ function getConfig() {
             .map((t) => t.trim())
             .filter(Boolean);
         const observation_scopes = merged.observation_scopes?.trim() || undefined;
+        const retain_every_n_turns = Math.max(1, parseInt(merged.retain_every_n_turns || "1", 10) || 1);
+        const retain_strip_secrets = merged.retain_strip_secrets === "false" ? false : true;
+        const retain_max_message_chars = Math.max(200, parseInt(merged.retain_max_message_chars || "4000", 10) || 4000);
         return {
             api_url: merged.api_url,
             api_key: resolveApiKey(global, local),
@@ -114,6 +117,9 @@ function getConfig() {
             homedir_project,
             retain_tags,
             observation_scopes,
+            retain_every_n_turns,
+            retain_strip_secrets,
+            retain_max_message_chars,
         };
     }
     catch (e) {
@@ -411,6 +417,47 @@ function readRecentLogErrors(maxLines = 20) {
         return [];
     }
 }
+// ---------------------------------------------------------------------------
+// Retain sanitization (ported from @brycehamrick/opencode-hindsight)
+// ---------------------------------------------------------------------------
+/** Remove likely secrets and sensitive tokens from retained content. */
+function stripSecrets(content) {
+    content = content.replace(/\bAuthorization\s*[:=]\s*["']?\s*[Bb]earer\s+\S+["']?/g, "[REDACTED_AUTH]");
+    content = content.replace(/\b(?:api[_-]?key|apikey|token|secret|password|passwd|pwd)\s*[:=]\s*["']?[\w\-./+=]{8,}["']?/gi, "[REDACTED_SECRET]");
+    content = content.replace(/\bgh[pousr]_[A-Za-z0-9_]{36,}\b/g, "[REDACTED_GITHUB_TOKEN]");
+    content = content.replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]");
+    content = content.replace(/-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]");
+    return content;
+}
+/** Collapse large base64-like blobs (>=64 chars) to a length marker. */
+function stripBase64(content, maxChunkLength = 64) {
+    return content.replace(/([A-Za-z0-9+/]{64,}={1,2}|[A-Za-z0-9+/]{128,})/g, (match) => {
+        if (match.length <= maxChunkLength)
+            return match;
+        return `[BASE64:${match.length}chars]`;
+    });
+}
+/** All memory-block formats that could leak back into retained transcripts. */
+function stripAllMemoryBlocks(content) {
+    return content
+        .replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, "")
+        .replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, "")
+        .replace(/Relevant context from memory:[\s\S]*?(?=\n\n|$)/g, "");
+}
+function sanitizeTranscript(transcript, config) {
+    if (config.retain_strip_secrets !== false) {
+        transcript = stripSecrets(transcript);
+        transcript = stripBase64(transcript);
+    }
+    return stripAllMemoryBlocks(transcript);
+}
+/** Trivial-prompt filter: short acknowledgements that carry no memory value. */
+function isTrivialPrompt(prompt) {
+    if (prompt.length < 5)
+        return true;
+    const t = prompt.trim().toLowerCase();
+    return /^\s*(ok|okay|yes|no|thanks|thank you|continue|next|done|sure|stop|go ahead|sounds good|got it|perfect|great|cool|nice|yep|nope|k|sounds good to me)\s*[.!?]*\s*$/.test(t);
+}
 const OPERATIONAL_TOOLS = [
     "bash", "nu", "process", "read", "write", "edit",
     "grep", "ast_grep_search", "ast_grep_replace", "lsp_navigation"
@@ -579,6 +626,9 @@ export default function hindsightExtension(pi) {
         hookStats.retain = {};
         retainSuccessCount = 0;
         retainEligibleCount = 0;
+        userTurnCount = 0;
+        retainedTurnCount = 0;
+        pendingTurns = [];
         ctx.ui.setStatus("hindsight", undefined);
         log("session_start: state reset");
         const config = getConfig();
@@ -611,11 +661,16 @@ export default function hindsightExtension(pi) {
         }
     });
     pi.on("session_compact", async (_event, ctx) => {
+        // Compaction summarizes/wipes the raw context — flush any gated-but-unretained
+        // turns first so the source material isn't lost.
+        await flushPendingTurns(ctx, "compact");
         sessionCwd = ctx.cwd || process.cwd();
         recallDone = false;
         recallAttempts = 0;
         retainSuccessCount = 0;
         retainEligibleCount = 0;
+        userTurnCount = 0;
+        retainedTurnCount = 0;
         ctx.ui.setStatus("hindsight", undefined);
         log("session_compact: state reset");
     });
@@ -914,6 +969,102 @@ export default function hindsightExtension(pi) {
     // -----------------------------------------------------------------------
     // Auto-Retain (agent_end)
     // -----------------------------------------------------------------------
+    // Buffered turn for gated retention: the transcript of one user turn plus
+    // its user prompt, retained only every retain_every_n_turns (flushed on
+    // shutdown/compact so the tail is never lost).
+    let pendingTurns = [];
+    let userTurnCount = 0;
+    let retainedTurnCount = 0;
+    function buildTurnTranscript(event, lastUserPrompt, config) {
+        let transcript = `[role: user]\n${lastUserPrompt}\n[user:end]\n\n[role: assistant]\n`;
+        const messages = event.messages || [];
+        for (const msg of messages) {
+            if (msg.role !== "assistant")
+                continue;
+            const content = msg.content;
+            if (typeof content === "string") {
+                transcript += `${content.slice(0, config.retain_max_message_chars ?? 4000)}\n`;
+            }
+            else if (Array.isArray(content)) {
+                for (const block of content) {
+                    if (block.type === "text") {
+                        transcript += `${String(block.text).slice(0, config.retain_max_message_chars ?? 4000)}\n`;
+                    }
+                    else if (block.type === "tool_use") {
+                        if (!OPERATIONAL_TOOLS.includes(block.name)) {
+                            transcript += `[Tool Use: ${block.name}]\n`;
+                            if (block.input) {
+                                transcript += `${JSON.stringify(block.input).slice(0, config.retain_max_message_chars ?? 4000)}\n`;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        transcript += `[assistant:end]`;
+        return transcript;
+    }
+    async function retainBuffer(buffer, config, ctx, reason) {
+        if (buffer.length === 0)
+            return;
+        const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
+        // One retain call for the whole buffered window: each turn stays delimited
+        // in the transcript, extraction still sees per-turn structure.
+        const transcript = buffer.map(t => t.transcript).join("\n\n");
+        const firstPrompt = buffer[0].prompt;
+        const allTags = [...new Set(buffer.flatMap(t => t.tags))];
+        const banks = getRetainBanks(config, firstPrompt);
+        if (banks.length === 0) {
+            log(`retainBuffer(${reason}): no retain banks, discarding ${buffer.length} turns`);
+            return;
+        }
+        retainEligibleCount++;
+        log(`retainBuffer(${reason}): retaining ${buffer.length} turns to banks=${banks.join(",")}`);
+        await Promise.allSettled(banks.map(async (bank) => {
+            const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${config.api_key || ""}`
+                },
+                body: JSON.stringify({
+                    items: [{
+                            content: transcript,
+                            document_id: `session-${sessionId}`,
+                            update_mode: "append",
+                            context: `pi coding session: ${firstPrompt.slice(0, 100)}`,
+                            timestamp: new Date().toISOString(),
+                            ...(allTags.length > 0 && { tags: allTags }),
+                            ...(config.observation_scopes && { observation_scopes: config.observation_scopes })
+                        }],
+                    async: true
+                })
+            });
+            log(`retainBuffer(${reason}): bank=${bank} retain HTTP ${res.status}`);
+            if (!res.ok)
+                throw new Error(`HTTP ${res.status}`);
+            return bank;
+        })).then((results) => {
+            const succeeded = results.filter(r => r.status === "fulfilled").length;
+            if (succeeded > 0) {
+                retainSuccessCount++;
+                hookStats.retain = {
+                    firedAt: new Date().toISOString(),
+                    result: "ok",
+                    detail: `${buffer.length} turns → ${succeeded}/${results.length} banks`,
+                };
+                if (ctx.ui?.setStatus && (config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback)) {
+                    ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                }
+            }
+            else {
+                hookStats.retain = { firedAt: new Date().toISOString(), result: "failed", detail: "all banks unreachable" };
+                if (ctx.ui?.setStatus && (config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback)) {
+                    ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                }
+            }
+        });
+    }
     pi.on("agent_end", async (event, ctx) => {
         log("agent_end: fired");
         const config = getConfig();
@@ -926,13 +1077,12 @@ export default function hindsightExtension(pi) {
             return;
         }
         const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
-        const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
         if (!lastUserPrompt) {
             log("agent_end: no user prompt found, skipping");
             return;
         }
         // Skip trivial interactions
-        if (lastUserPrompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(lastUserPrompt.trim())) {
+        if (isTrivialPrompt(lastUserPrompt)) {
             log(`agent_end: trivial prompt, skipping retain`);
             return;
         }
@@ -941,32 +1091,8 @@ export default function hindsightExtension(pi) {
             log("agent_end: opt-out tag, skipping retain");
             return;
         }
-        let transcript = `[role: user]\n${lastUserPrompt}\n[user:end]\n\n[role: assistant]\n`;
-        const messages = event.messages || [];
-        for (const msg of messages) {
-            if (msg.role !== "assistant")
-                continue;
-            const content = msg.content;
-            if (typeof content === "string") {
-                transcript += `${content}\n`;
-            }
-            else if (Array.isArray(content)) {
-                for (const block of content) {
-                    if (block.type === "text") {
-                        transcript += `${block.text}\n`;
-                    }
-                    else if (block.type === "tool_use") {
-                        if (!OPERATIONAL_TOOLS.includes(block.name)) {
-                            transcript += `[Tool Use: ${block.name}]\n`;
-                            if (block.input) {
-                                transcript += `${JSON.stringify(block.input)}\n`;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        transcript += `[assistant:end]`;
+        // Buffer this turn; retain when the gate fires.
+        let transcript = buildTurnTranscript(event, lastUserPrompt, config);
         // Extract explicit #tags from the user prompt (ignoring our reserved control tags)
         const reservedTags = new Set(["nomem", "skip", "global", "me"]);
         const extractedTags = Array.from(lastUserPrompt.matchAll(/(?<=^|\s)#([a-zA-Z0-9_-]+)/g))
@@ -975,164 +1101,63 @@ export default function hindsightExtension(pi) {
         // Static tags from retain_tags / HINDSIGHT_RETAIN_TAGS always apply (identity),
         // then prompt #hashtags; deduped, static first.
         const allTags = [...new Set([...(config.retain_tags || []), ...extractedTags])];
-        // Strip memory tags to prevent feedback loop
-        transcript = transcript.replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, "");
-        transcript = transcript.trim();
+        // Sanitize (strip memory blocks, secrets, base64) before buffering
+        transcript = sanitizeTranscript(transcript, config).trim();
         if (transcript.length < 20)
             return;
         // Hard-cap massive transcripts (e.g. agent printing full file out) to avoid bombing server
         if (transcript.length > 50000) {
             transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
         }
-        const banks = getRetainBanks(config, lastUserPrompt);
-        // Home-dir session with homedir_project=false and no #global/#me: nothing to retain.
-        // Returning here keeps an empty bank list from being reported as a failed retain.
-        if (banks.length === 0) {
-            log("agent_end: no retain banks, skipping");
-            return;
-        }
-        // Count this attempt (before the retain APIs)
-        retainEligibleCount++;
-        // Async retain: fire and forget, don't block
-        if (config.async_retain !== false) {
-            log("agent_end: async retain fired (not awaiting)");
-            const retainPromise = Promise.allSettled(banks.map(async (bank) => {
-                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${config.api_key || ""}`
-                    },
-                    body: JSON.stringify({
-                        items: [{
-                                content: transcript,
-                                document_id: `session-${sessionId}`,
-                                update_mode: "append",
-                                context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
-                                timestamp: new Date().toISOString(),
-                                ...(allTags.length > 0 && { tags: allTags }),
-                                ...(config.observation_scopes && { observation_scopes: config.observation_scopes })
-                            }],
-                        async: true
-                    })
-                });
-                log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
-                if (!res.ok)
-                    throw new Error(`HTTP ${res.status}`);
-                return bank;
-            }));
-            retainPromise.then((results) => {
-                try {
-                    const succeededBanks = results
-                        .filter(r => r.status === "fulfilled")
-                        .map(r => r.value);
-                    const allFailed = succeededBanks.length === 0;
-                    hookStats.retain = {
-                        firedAt: new Date().toISOString(),
-                        result: allFailed ? "failed" : "ok",
-                        detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
-                    };
-                    if (!allFailed)
-                        retainSuccessCount++;
-                    const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-                    const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
-                    if (allFailed) {
-                        log("agent_end: async retain - all banks failed");
-                        pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
-                        if (showStatus) {
-                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-                        }
-                    }
-                    else {
-                        log(`agent_end: async retain - succeeded banks=${succeededBanks.join(",")}`);
-                        if (showStatus) {
-                            ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-                        }
-                        if (showMessage) {
-                            pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: succeededBanks } }, { deliverAs: "nextTurn" });
-                        }
-                    }
-                }
-                catch (error) {
-                    log(`agent_end: async retain feedback skipped: ${String(error)}`);
-                }
-            }).catch((error) => {
-                log(`agent_end: async retain failed: ${String(error)}`);
-            });
-            return;
-        }
-        // Sync retain (original behavior)
-        try {
-            log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${allTags.join(",")}`);
-            const results = await Promise.allSettled(banks.map(async (bank) => {
-                const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${config.api_key || ""}`
-                    },
-                    body: JSON.stringify({
-                        items: [{
-                                content: transcript,
-                                document_id: `session-${sessionId}`,
-                                update_mode: "append",
-                                context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
-                                timestamp: new Date().toISOString(),
-                                ...(allTags.length > 0 && { tags: allTags }),
-                                ...(config.observation_scopes && { observation_scopes: config.observation_scopes })
-                            }],
-                        async: true
-                    })
-                });
-                log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
-                if (!res.ok)
-                    throw new Error(`HTTP ${res.status}`);
-                return bank;
-            }));
-            const succeededBanks = results
-                .filter(r => r.status === "fulfilled")
-                .map(r => r.value);
-            const allFailed = succeededBanks.length === 0;
-            hookStats.retain = {
-                firedAt: new Date().toISOString(),
-                result: allFailed ? "failed" : "ok",
-                detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
-            };
-            if (!allFailed)
-                retainSuccessCount++;
-            const showMessage = config.retain_feedback === "message" || config.retain_feedback === "both";
-            const showStatus = config.retain_feedback === "status" || config.retain_feedback === "both" || !config.retain_feedback;
-            if (allFailed) {
-                log("agent_end: all banks failed - sending next-turn notification");
-                if (showStatus) {
-                    ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
-                }
-                pi.sendMessage({
-                    customType: "hindsight-retain-failed",
-                    content: "",
-                    display: true,
-                }, { deliverAs: "nextTurn" });
+        userTurnCount++;
+        pendingTurns.push({ prompt: lastUserPrompt, transcript, tags: allTags });
+        const gate = config.retain_every_n_turns ?? 1;
+        if (userTurnCount - retainedTurnCount >= gate) {
+            const buffer = pendingTurns;
+            pendingTurns = [];
+            retainedTurnCount = userTurnCount;
+            if (config.async_retain !== false) {
+                log("agent_end: async gated retain fired (not awaiting)");
+                retainBuffer(buffer, config, ctx, `gate:${gate}`).catch((e) => log(`agent_end: gated retain failed: ${String(e)}`));
             }
             else {
-                if (showStatus) {
-                    ctx.ui.setStatus("hindsight", `Memorized: ${retainSuccessCount}/${retainEligibleCount}`);
+                try {
+                    await retainBuffer(buffer, config, ctx, `gate:${gate}`);
                 }
-                else {
-                    ctx.ui.setStatus("hindsight", undefined);
-                }
-                if (showMessage) {
-                    pi.sendMessage({
-                        customType: "hindsight-retain",
-                        content: "",
-                        display: true,
-                        details: { banks: succeededBanks },
-                    }, { deliverAs: "nextTurn" });
+                catch (e) {
+                    log(`agent_end: error ${e}`);
                 }
             }
         }
-        catch (e) {
-            log(`agent_end: error ${e}`);
+        else {
+            log(`agent_end: buffered turn ${userTurnCount} (gate ${gate}, ${pendingTurns.length} pending)`);
         }
+    });
+    // Flush whatever the gate hasn't retained: session shutdown (quit, reload,
+    // /new, /resume, /fork) and before compaction wipes context.
+    async function flushPendingTurns(ctx, reason) {
+        if (pendingTurns.length === 0)
+            return;
+        const config = getConfig();
+        if (!config || !config.api_url || config.retain_enabled === false) {
+            log(`flush(${reason}): config unavailable or retain disabled, discarding ${pendingTurns.length} turns`);
+            pendingTurns = [];
+            return;
+        }
+        const buffer = pendingTurns;
+        pendingTurns = [];
+        retainedTurnCount = userTurnCount;
+        try {
+            // Await: shutdown is the last chance — a fire-and-forget fetch can be
+            // killed before the request leaves the process.
+            await retainBuffer(buffer, config, ctx, reason);
+        }
+        catch (e) {
+            log(`flush(${reason}): failed ${e}`);
+        }
+    }
+    pi.on("session_shutdown", async (_event, ctx) => {
+        await flushPendingTurns(ctx, "shutdown");
     });
     // -----------------------------------------------------------------------
     // Commands
