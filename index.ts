@@ -922,7 +922,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), config.recall_timeout ?? 10000);
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
+        // v1.2.0 moved reflect off the memories subpath (405 on .../memories/reflect).
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/reflect`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
