@@ -627,7 +627,17 @@ export function isSubagentChildProcess(env: NodeJS.ProcessEnv = process.env): bo
 
 /** Reflect lives directly under the bank, not under /memories (unlike recall). */
 export function reflectUrl(apiUrl: string, bank: string): string {
-  return `${apiUrl}/v1/default/banks/${bank}/reflect`;
+  return `${apiUrl}/v1/default/banks/${encodeURIComponent(bank)}/reflect`;
+}
+
+/**
+ * Bank reflect queries. Mirrors explicit retain: with `homedir_project = false` in the home
+ * directory the project bank is suppressed, so reflect reads global_bank instead of the
+ * `project-<user>` bank that nothing writes to.
+ */
+export function getReflectBank(config: HindsightConfig, cwd: string = sessionCwd): string | null {
+  if (cwd === homedir() && config.homedir_project === false) return config.global_bank ?? null;
+  return getProjectBank(config);
 }
 
 /** Hindsight returns the synthesis in `text`; `synthesis` is kept for older servers. */
@@ -845,30 +855,37 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     parameters: Type.Object({
       query: Type.String()
     }),
-    async execute(_id, params) {
+    async execute(_id, params, signal) {
       const { query } = params as { query: string };
       const config = getConfig();
       if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
 
-      const bank = getProjectBank(config);
+      const bank = getReflectBank(config);
+      if (!bank) return { content: [{ type: "text" as const, text: "Hindsight: no bank available. Set global_bank in ~/.hindsight/config." }], details: {}, isError: true };
       try {
+        // Reflect runs an agentic loop server-side and routinely takes 20-120s.
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), config.reflect_timeout ?? 120000);
-        const res = await fetch(reflectUrl(config.api_url, bank), {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify({ query }),
-          signal: controller.signal
-        });
-        clearTimeout(timeout);
-        if (res.ok) {
-          const data = await res.json();
-          return { content: [{ type: "text" as const, text: reflectText(data) }], details: {} };
+        try {
+          // Esc cancels the in-flight request; the timer still caps a hung server.
+          const res = await fetch(reflectUrl(config.api_url, bank), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${config.api_key || ""}`
+            },
+            body: JSON.stringify({ query }),
+            signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+          });
+          if (res.ok) {
+            // Keep the timer armed while the body streams: fetch resolves on headers alone.
+            const data = await res.json();
+            return { content: [{ type: "text" as const, text: reflectText(data) }], details: {} };
+          }
+          return { content: [{ type: "text" as const, text: `Failed to reflect (HTTP ${res.status}).` }], details: {}, isError: true };
+        } finally {
+          clearTimeout(timeout);
         }
-        return { content: [{ type: "text" as const, text: `Failed to reflect (HTTP ${res.status}).` }], details: {}, isError: true };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
       }

@@ -8,6 +8,7 @@
 
 import { test, describe, beforeEach, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Minimal Pi API mock
@@ -1545,9 +1546,10 @@ describe("resolveApiKey", { skip: !extensionDepsInstalled && "extension deps not
 describe("reflect", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
   let reflectUrl: (apiUrl: string, bank: string) => string;
   let reflectText: (data: any) => string;
+  let getReflectBank: (config: any, cwd?: string) => string | null;
 
   before(async () => {
-    ({ reflectUrl, reflectText } = await import("./index.ts"));
+    ({ reflectUrl, reflectText, getReflectBank } = await import("./index.ts"));
   });
 
   test("posts to /banks/{bank}/reflect, not /memories/reflect", () => {
@@ -1563,5 +1565,26 @@ describe("reflect", { skip: !extensionDepsInstalled && "extension deps not insta
   test("falls back to synthesis, then to JSON", () => {
     assert.equal(reflectText({ synthesis: "legacy" }), "legacy");
     assert.equal(reflectText({ other: 1 }), '{"other":1}');
+  });
+
+  test("encodes the bank as a path segment", () => {
+    assert.equal(reflectUrl("https://h", "my bank"), "https://h/v1/default/banks/my%20bank/reflect");
+    assert.ok(reflectUrl("https://h", "team#1").endsWith("/banks/team%231/reflect"), "a # must not truncate the URL");
+  });
+
+  test("queries global_bank when homedir_project=false in the home directory", () => {
+    const config = { api_url: "http://x", homedir_project: false, global_bank: "me", project_bank_id: "proj" };
+    assert.equal(getReflectBank(config, homedir()), "me");
+  });
+
+  test("reports no bank rather than a bank nothing writes to", () => {
+    const config = { api_url: "http://x", homedir_project: false, project_bank_id: "proj" };
+    assert.equal(getReflectBank(config, homedir()), null);
+  });
+
+  test("keeps the project bank everywhere else", () => {
+    const config = { api_url: "http://x", homedir_project: false, global_bank: "me", project_bank_id: "proj" };
+    assert.equal(getReflectBank(config, "/tmp/some-repo"), "proj");
+    assert.equal(getReflectBank({ ...config, homedir_project: true }, homedir()), "proj");
   });
 });
